@@ -1,0 +1,33 @@
+--- a/xmoe/quant/hadamard_inner.cuh	2026-10-17 22:47:08.269484625 +0000
++++ b/xmoe/quant/hadamard_inner.cuh	2026-11-13 11:49:59.315766471 +0000
+@@ -6,6 +6,7 @@
+ // Non-gated relu2 (NemotronH): the g input is unused (its GEMM is skipped by the caller); the
+ // gate lane is set to relu(u) so the gate multiply below yields relu(u) * u = relu^2(u) exactly
+ #define ACT_RELU2_NOGATE 2
++#define ACT_INKLING2 5
+ 
+ // Hadamard transform 128-element vector across one warp, with optional pre and post scales
+ 
+@@ -381,6 +382,22 @@
+             vg.y = __hmax2(vu.y, __float2half2_rn(0.0f));
+             break;
+ 
++        case ACT_INKLING2:
++        {
++            // Inkling2: 4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25); act_limit unused
++            float2 g0 = __half22float2(vg.x), g1 = __half22float2(vg.y);
++            float2 u0 = __half22float2(vu.x), u1 = __half22float2(vu.y);
++            #define _INK_G(g) (4.0f * tanhf((g) * 0.25f) * (1.0f / (1.0f + __expf(-(g)))))
++            #define _INK_U(u) (25.0f * tanhf((u) * 0.04f))
++            vg.x = __floats2half2_rn(_INK_G(g0.x), _INK_G(g0.y));
++            vg.y = __floats2half2_rn(_INK_G(g1.x), _INK_G(g1.y));
++            vu.x = __floats2half2_rn(_INK_U(u0.x), _INK_U(u0.y));
++            vu.y = __floats2half2_rn(_INK_U(u1.x), _INK_U(u1.y));
++            #undef _INK_G
++            #undef _INK_U
++            break;
++        }
++
+         default:
+             break;
+     }

@@ -1,0 +1,73 @@
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+index b343ae2b..d718ef4b 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+@@ -209,7 +209,7 @@ MoeCoopParams exl3_moe_coop_prepare
+     TORCH_CHECK(!(mcg && mul1), "exl3_moe_coop: specified both mcg and mul1");
+     TORCH_CHECK(Kg >= 1 && Kg <= 8 && Ku >= 1 && Ku <= 8 && Kd >= 1 && Kd <= 8, "exl3_moe_coop: K out of range");
+     TORCH_CHECK(!gated || Kg == Ku, "exl3_moe_coop: gate and up must share a bit width");
+-    TORCH_CHECK(act >= 0 && act <= 3, "exl3_moe_coop: unknown activation");
++    TORCH_CHECK((act >= 0 && act <= 3) || act == 5, "exl3_moe_coop: unknown activation");
+ 
+     MoeCoopParams p = {};
+     p.Hi = Hi;
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+index 3bf30613..cda9ac9d 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+@@ -13,6 +13,7 @@
+ #define MOE_COOP_ACT_GELU 1
+ #define MOE_COOP_ACT_RELU2 2
+ #define MOE_COOP_ACT_SILU_OAI 3
++#define MOE_COOP_ACT_INKLING2 5
+ 
+ #define MOE_COOP_THREADS 512
+ #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+index ce8a2f1e..ff58b826 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+@@ -115,6 +115,8 @@ __device__ __forceinline__ float act_oai_swiglu(float g, float u, float limit)
+ __device__ __forceinline__ float act_gate(int act, bool gated, float g, float u, float limit)
+ {
+     if (act == MOE_COOP_ACT_SILU_OAI) return act_oai_swiglu(g, u, limit);
++    if (act == MOE_COOP_ACT_INKLING2)
++        return 4.0f * tanhf(g * 0.25f) * (1.0f / (1.0f + __expf(-g))) * 25.0f * tanhf(u * 0.04f);
+     float x;
+     if (!gated) x = fmaxf(0.0f, u);
+     else if (act == MOE_COOP_ACT_SILU) x = act_silu(g);
+diff --git a/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh b/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh
+index b6bad240..827e5a53 100644
+--- a/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh
++++ b/exllamav3/exllamav3_ext/quant/hadamard_inner.cuh
+@@ -6,6 +6,7 @@
+ // Non-gated relu2 (NemotronH): the g input is unused (its GEMM is skipped by the caller); the
+ // gate lane is set to relu(u) so the gate multiply below yields relu(u) * u = relu^2(u) exactly
+ #define ACT_RELU2_NOGATE 2
++#define ACT_INKLING2 5
+ 
+ // Hadamard transform 128-element vector across one warp, with optional pre and post scales
+ 
+@@ -381,6 +382,22 @@ void had_hf_r_128_guad_inner
+             vg.y = __hmax2(vu.y, __float2half2_rn(0.0f));
+             break;
+ 
++        case ACT_INKLING2:
++        {
++            // Inkling2: 4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25); act_limit unused
++            float2 g0 = __half22float2(vg.x), g1 = __half22float2(vg.y);
++            float2 u0 = __half22float2(vu.x), u1 = __half22float2(vu.y);
++            #define _INK_G(g) (4.0f * tanhf((g) * 0.25f) * (1.0f / (1.0f + __expf(-(g)))))
++            #define _INK_U(u) (25.0f * tanhf((u) * 0.04f))
++            vg.x = __floats2half2_rn(_INK_G(g0.x), _INK_G(g0.y));
++            vg.y = __floats2half2_rn(_INK_G(g1.x), _INK_G(g1.y));
++            vu.x = __floats2half2_rn(_INK_U(u0.x), _INK_U(u0.y));
++            vu.y = __floats2half2_rn(_INK_U(u1.x), _INK_U(u1.y));
++            #undef _INK_G
++            #undef _INK_U
++            break;
++        }
++
+         default:
+             break;
+     }
