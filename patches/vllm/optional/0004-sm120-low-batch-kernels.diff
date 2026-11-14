@@ -1,0 +1,165 @@
+diff --git a/vllm/models/inkling2/exl3_moe.py b/vllm/models/inkling2/exl3_moe.py
+index 9efa3dedc..73479600a 100644
+--- a/vllm/models/inkling2/exl3_moe.py
++++ b/vllm/models/inkling2/exl3_moe.py
+@@ -40,9 +40,48 @@ EXPERT_NAME = re.compile(
+     r"^model\.llm\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(w[123])\.(trellis|suh|svh|mul1|mcg)$"
+ )
+ _ACT_INKLING2 = 5
+-
+-
+-_COOP_MAX_ROWS = 8
++from .ops.linear import _SM12X_GEMV, GEMV_MAX_TOKENS
++from .ops.gemv_sm12x import gemv_lowm
++
++from vllm.triton_utils import tl, triton  # noqa: E402
++
++_FUSED_ROUTE = os.environ.get("INKLING2_FUSED_ROUTE", "1") == "1"
++
++
++@triton.jit
++def _route_topk_kernel(Logits, Bias, Wout, Ids, E, scale,
++                       TOPK: tl.constexpr, BLOCK_E: tl.constexpr):
++    """One row: sigmoid scores, top-k of (score + bias), weights = normalized
++    scores of the chosen experts * scale (fp16), ids (int64)."""
++    row = tl.program_id(0)
++    e = tl.arange(0, BLOCK_E)
++    em = e < E
++    logit = tl.load(Logits + row * E + e, mask=em, other=0.0)
++    score = tl.sigmoid(logit)
++    key = tl.where(em, score + tl.load(Bias + e, mask=em, other=0.0).to(tl.float32), float("-inf"))
++    k = tl.arange(0, TOPK)
++    ids = tl.zeros((TOPK,), tl.int32)
++    ws = tl.zeros((TOPK,), tl.float32)
++    for i in tl.static_range(TOPK):
++        best = tl.max(key, axis=0)
++        idx = tl.min(tl.where(key == best, e, BLOCK_E), axis=0)
++        ws = tl.where(k == i, tl.sum(tl.where(e == idx, score, 0.0), axis=0), ws)
++        ids = tl.where(k == i, idx, ids)
++        key = tl.where(e == idx, float("-inf"), key)
++    ws = ws / (tl.sum(ws, axis=0) + 1e-20) * scale
++    tl.store(Wout + row * TOPK + k, ws.to(tl.float16))
++    tl.store(Ids + row * TOPK + k, ids.to(tl.int64))
++
++
++def fused_route(logits: torch.Tensor, bias: torch.Tensor, topk: int, scale: float):
++    T, E = logits.shape
++    w = torch.empty((T, topk), dtype=torch.float16, device=logits.device)
++    ids = torch.empty((T, topk), dtype=torch.int64, device=logits.device)
++    _route_topk_kernel[(T,)](logits, bias, w, ids, E, float(scale), topk,
++                             triton.next_power_of_2(E), num_warps=4)
++    return w, ids
++
++_COOP_MAX_ROWS = int(os.environ.get("INKLING2_COOP_MAX_ROWS", "8"))
+ _FUSED_ROWS = int(os.environ.get("INKLING2_EXL3_FUSED_ROWS", "512"))
+ _MTILE_T1, _MTILE_T2 = 16, 32
+ _DO_ENABLED = os.environ.get("INKLING2_EXL3_DO", "1") == "1"
+@@ -349,8 +388,12 @@ class Inkling2Exl3MoE(nn.Module):
+         self.tp_size = get_tensor_model_parallel_world_size()
+ 
+     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+-        # bf16 x bf16 products are exact in fp32; fp32 accumulate + output
+-        logits = torch.mm(x, self.gate.weight.t(), out_dtype=torch.float32)
++        if _SM12X_GEMV and x.shape[0] <= GEMV_MAX_TOKENS:
++            logits = gemv_lowm(x, self.gate.weight, torch.float32)
++        else:  # bf16 x bf16 products are exact in fp32; fp32 accumulate + output
++            logits = torch.mm(x, self.gate.weight.t(), out_dtype=torch.float32)
++        if _FUSED_ROUTE and x.shape[0] <= _COOP_MAX_ROWS:
++            return fused_route(logits.contiguous(), self.gate.bias, self.gate.topk, self.gate.route_scale)
+         scores = logits.sigmoid()
+         ids = torch.topk(scores + self.gate.bias, self.gate.topk, dim=-1, sorted=False).indices
+         w = scores.gather(1, ids)
+diff --git a/vllm/models/inkling2/ops/gemv_sm12x.py b/vllm/models/inkling2/ops/gemv_sm12x.py
+new file mode 100644
+index 000000000..99a7b2c0c
+--- /dev/null
++++ b/vllm/models/inkling2/ops/gemv_sm12x.py
+@@ -0,0 +1,44 @@
++"""Low-M (decode) GEMV for SM12x: y[M, N] = x[M, K] @ W[N, K]^T, fp32 accumulate, M <= 16.
++Each weight tile is read once and multiplied against all rows (zero-padded to 16) with tl.dot."""
++import torch
++
++from vllm.triton_utils import tl, triton
++
++@triton.jit
++def _gemv_kernel(X, W, Y, M, N, K, stride_xm, stride_ym,
++                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr):
++    pid_n = tl.program_id(0); pid_k = tl.program_id(1)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    rm = tl.arange(0, 16)
++    nmask = rn < N
++    k_per = tl.cdiv(K, SPLIT_K * BLOCK_K) * BLOCK_K
++    k0 = pid_k * k_per
++    acc = tl.zeros((16, BLOCK_N), tl.float32)
++    for kk in range(0, k_per, BLOCK_K):
++        rk = k0 + kk + tl.arange(0, BLOCK_K)
++        kmask = rk < K
++        w = tl.load(W + rn[None, :] * K + rk[:, None], mask=nmask[None, :] & kmask[:, None], other=0.0,
++                    eviction_policy="evict_first")
++        x = tl.load(X + rm[:, None] * stride_xm + rk[None, :], mask=(rm[:, None] < M) & kmask[None, :], other=0.0)
++        acc = tl.dot(x, w, acc)
++    ymask = (rm[:, None] < M) & nmask[None, :]
++    if SPLIT_K == 1:
++        tl.store(Y + rm[:, None] * stride_ym + rn[None, :], acc.to(Y.dtype.element_ty), mask=ymask)
++    else:
++        tl.atomic_add(Y + rm[:, None] * stride_ym + rn[None, :], acc, mask=ymask)
++
++def gemv_lowm(x, w, out_dtype=None, block_n=None, block_k=None, split_k=None):
++    M, K = x.shape; N = w.shape[0]
++    assert M <= 16
++    out_dtype = out_dtype or x.dtype
++    if split_k is None:
++        split_k = 1 if N >= 2048 else max(1, min(8, 2048 // N))
++    block_n = block_n or 16
++    block_k = block_k or 256
++    if split_k > 1:
++        y = torch.zeros((M, N), dtype=torch.float32, device=x.device)
++    else:
++        y = torch.empty((M, N), dtype=out_dtype, device=x.device)
++    _gemv_kernel[(triton.cdiv(N, block_n), split_k)](x, w, y, M, N, K, x.stride(0), y.stride(0),
++                                                    block_n, block_k, split_k, num_warps=4)
++    return y if (split_k == 1 or out_dtype == torch.float32) else y.to(out_dtype)
+diff --git a/vllm/models/inkling2/ops/linear.py b/vllm/models/inkling2/ops/linear.py
+index 4056f667e..bbec6ec2e 100644
+--- a/vllm/models/inkling2/ops/linear.py
++++ b/vllm/models/inkling2/ops/linear.py
+@@ -3,9 +3,13 @@
+ """bf16 linears: small batches on FlashInfer's CuTe DSL low-M kernels, and the
+ reference `linear` with fp32 accumulation in ordered 1024-wide K groups."""
+ 
++import os
++
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
++
++from .gemv_sm12x import gemv_lowm
+ from vllm.utils.flashinfer import is_flashinfer_autotuning
+ 
+ # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
+@@ -15,6 +19,8 @@ LOW_M_MAX_TOKENS = 32
+ 
+ _cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (10, 0)
+ _SM12X_SMALL_SMEM = _cap[0] in (8, 12)
++_SM12X_GEMV = _SM12X_SMALL_SMEM and os.environ.get("INKLING2_GEMV", "1") == "1"
++GEMV_MAX_TOKENS = 16
+ 
+ 
+ def linear(
+@@ -25,6 +31,16 @@ def linear(
+     if out is not None:
+         assert x.shape[0] > LOW_M_MAX_TOKENS
+         return torch.mm(x, weight.t(), out=out)
++    # SM12x has no CuTe DSL low-M kernels; cuBLAS reads small-batch weights at
++    # well under bandwidth, so decode-sized batches use a Triton GEMV.
++    if (
++        _SM12X_GEMV
++        and x.shape[0] <= GEMV_MAX_TOKENS
++        and x.stride(-1) == 1
++        and weight.is_contiguous()
++        and not is_flashinfer_autotuning()
++    ):
++        return gemv_lowm(x, weight)
+     # Autotuning would profile the CuTe DSL kernels past their 32-row limit.
+     if x.shape[0] > LOW_M_MAX_TOKENS or is_flashinfer_autotuning() or _SM12X_SMALL_SMEM:
+         return torch.nn.functional.linear(x, weight)

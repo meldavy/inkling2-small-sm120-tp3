@@ -1,0 +1,1296 @@
+diff --git a/vllm/models/inkling2/attention.py b/vllm/models/inkling2/attention.py
+index 1dc92af01..0b731911b 100644
+--- a/vllm/models/inkling2/attention.py
++++ b/vllm/models/inkling2/attention.py
+@@ -18,6 +18,8 @@ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.forward_context import get_forward_context
++
++from .ubatch import step_attn_metadata, ub_scope
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
+@@ -305,6 +307,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         x_v: torch.Tensor | None = None,
+         tau: torch.Tensor | None = None,
+         out: torch.Tensor | None = None,
++        ub: int = 0,
++        bounds: tuple = (),
+     ) -> torch.Tensor:
+         """Return this rank's bf16 `(T, hidden)` partial output (to be
+         all-reduced over TP), written to `out` if given.
+@@ -329,13 +333,19 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             self.v_sconv.dynamic_taps(x_v),
+             tau,
+             output,
++            ub=ub,
++            bounds=bounds,
+         )
+         out = linear(output, self.wo_ud.weight, out)
+         add_linear_lora(self.wo_ud, out, output)
+         return out
+ 
+     @eager_break_during_capture
+-    def _attention(
++    def _attention(self, *args, ub: int = 0, bounds: tuple = ()) -> None:
++        with ub_scope(ub, bounds):
++            self._attention_body(*args)
++
++    def _attention_body(
+         self,
+         positions: torch.Tensor,
+         q: torch.Tensor,
+@@ -358,7 +368,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         """
+         num_tokens = q.shape[0]
+         q = q.view(num_tokens, self.num_heads, self.head_dim)
+-        attn_metadata = get_forward_context().attn_metadata
++        attn_metadata = step_attn_metadata()
+         md = None
+         if isinstance(attn_metadata, dict) and self.kv_cache.numel() > 0:
+             md = cast(Inkling2AttentionMetadata, attn_metadata[self.prefix])
+diff --git a/vllm/models/inkling2/conv_state.py b/vllm/models/inkling2/conv_state.py
+index cc28c3e48..422296736 100644
+--- a/vllm/models/inkling2/conv_state.py
++++ b/vllm/models/inkling2/conv_state.py
+@@ -129,6 +129,11 @@ def _flat_slots(t: torch.Tensor | None, n: int) -> torch.Tensor | None:
+     return (t[:, 0] if t.dim() > 1 else t)[:n]
+ 
+ 
++# Index of the prefill microbatch being run (0 outside the overlap path): each
++# microbatch derives its conv fields into its own buffers.
++_UBATCH = [0]
++
++
+ def conv_fields(owner: "Inkling2ConvState", md, num_tokens: int) -> dict:
+     """Per-token / per-request fields the sconv kernels need, derived from the
+     stock short-conv (Mamba) metadata once per KV-cache group and step."""
+@@ -303,7 +308,7 @@ class Inkling2ConvState(nn.Module, MambaBase):
+ 
+     # --- kernels -----------------------------------------------------------------
+     def buffers(self) -> dict:
+-        key = "_bufs"
++        key = "_bufs" if _UBATCH[0] == 0 else f"_bufs{_UBATCH[0]}"
+         b = self.__dict__.get(key)
+         if b is None:
+             t, r = self._max_tokens, self._max_reqs
+diff --git a/vllm/models/inkling2/exl3_moe.py b/vllm/models/inkling2/exl3_moe.py
+index 73479600a..de620a030 100644
+--- a/vllm/models/inkling2/exl3_moe.py
++++ b/vllm/models/inkling2/exl3_moe.py
+@@ -121,11 +121,88 @@ def _do_ext():
+     return _do
+ 
+ 
++_HAR = None
++
++
++def _tp_peer_access(tp) -> bool:
++    """Whether every pair of TP ranks has CUDA peer access (agreed across ranks)."""
++    import torch.distributed as dist
++
++    me = torch.cuda.current_device()
++    devs = [None] * tp.world_size
++    dist.all_gather_object(devs, me, group=tp.cpu_group)
++    ok = all(torch.cuda.can_device_access_peer(me, d) for d in devs if d != me)
++    votes = [None] * tp.world_size
++    dist.all_gather_object(votes, ok, group=tp.cpu_group)
++    return all(votes)
++
++
++def _enabled(var: str, peer_access: bool) -> bool:
++    """INKLING2_HOST_AR / INKLING2_DMA_AR: auto (default) = only without peer
++    access; 1 = always; 0 = never."""
++    mode = os.environ.get(var, "auto")
++    return mode == "1" or (mode == "auto" and not peer_access)
++
++
++def init_host_all_reduce() -> None:
++    """Custom all-reduces for TP over PCIe without peer access. With peer access
++    (unless forced) all reductions use vLLM's all-reduce."""
++    global _HAR
++    if _HAR is not None or get_tensor_model_parallel_world_size() == 1:
++        return
++    from vllm.distributed import get_tp_group
++
++    tp = get_tp_group()
++    peer_access = _tp_peer_access(tp)
++    use_har = _enabled("INKLING2_HOST_AR", peer_access)
++    use_dma = tp.world_size == 3 and _enabled("INKLING2_DMA_AR", peer_access)
++    logger.info("Inkling2: TP peer access %s; host-mapped all-reduce %s, copy-engine all-reduce %s",
++                peer_access, "on" if use_har else "off", "on" if use_dma else "off")
++    if not use_har:
++        return
++    from .ops.host_allreduce import HostAllReduce
++
++    _HAR = HostAllReduce(
++        tp.cpu_group, tp.rank_in_group, tp.world_size, torch.device("cuda", torch.cuda.current_device()),
++        max_bytes=int(os.environ.get("INKLING2_HOST_AR_MAX_BYTES", str(64 << 10))),
++    )
++    logger.info("Inkling2: host-mapped all-reduce for tensors <= %d bytes", _HAR.max_bytes)
++    global _DMA
++    if use_dma:
++        from .ops.dma_allreduce import DmaAllReduce
++
++        _DMA = DmaAllReduce(
++            tp.cpu_group, tp.rank_in_group, tp.world_size,
++            torch.device("cuda", torch.cuda.current_device()),
++            cap_elems=int(os.environ.get("INKLING2_DMA_AR_CAP_TOKENS", "8192")) * 4608,
++            pieces=int(os.environ.get("INKLING2_DMA_AR_PIECES", "4")),
++        )
++        logger.info("Inkling2: copy-engine all-reduce for eager tensors >= %d bytes", _DMA_MIN)
++
++
++_DMA = None
++_DMA_MIN = int(os.environ.get("INKLING2_DMA_AR_MIN_BYTES", str(4 << 20)))
++
++
++
++
+ def ink_all_reduce(x: torch.Tensor) -> torch.Tensor:
+-    """TP all-reduce of a layer's partial output."""
++    if _HAR is not None and _HAR.ok(x):
++        return _HAR(x)
++    if (_DMA is not None and x.numel() * x.element_size() >= _DMA_MIN and _DMA.ok(x)
++            and (_DMA.use_graph_safe or not torch.cuda.is_current_stream_capturing())):
++        return _DMA(x)
+     return tensor_model_parallel_all_reduce(x)
+ 
+ 
++def ink_all_reduce_into(x: torch.Tensor, out: torch.Tensor) -> None:
++    """All-reduce `x` into the caller's `out` (same shape and dtype)."""
++    if (_DMA is not None and x.numel() * x.element_size() >= _DMA_MIN and _DMA.ok(x)):
++        _DMA(x, out)
++        return
++    out.copy_(ink_all_reduce(x))
++
++
+ class _Scratch:
+     _by_key: dict = {}
+ 
+diff --git a/vllm/models/inkling2/model.py b/vllm/models/inkling2/model.py
+index edc90a959..cbc961be4 100644
+--- a/vllm/models/inkling2/model.py
++++ b/vllm/models/inkling2/model.py
+@@ -12,8 +12,12 @@ from collections import Counter
+ from collections.abc import Callable, Hashable, Iterable, Sequence
+ from typing import Any
+ 
++import os
++
+ import regex as re
+ import torch
++
++from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from torch import nn
+ 
+ from vllm.config import VllmConfig, get_current_vllm_config
+@@ -68,7 +72,9 @@ from .lora import register as register_lora
+ from .exl3_moe import (
+     EXPERT_NAME,
+     Inkling2Exl3MoE,
++    init_host_all_reduce,
+     ink_all_reduce,
++    ink_all_reduce_into,
+     use_exl3_experts,
+ )
+ from .moe import Inkling2MoE, QuantFormat
+@@ -93,6 +99,27 @@ from .tp_pad import PAD_ATTR, pad_attn_tensor
+ _PAD_NAME = re.compile(r"^model\.llm\.layers\.\d+\.(attn\..*)$")
+ 
+ 
++_UB_OVERLAP = [os.environ.get("INKLING2_UBATCH_OVERLAP", "0") == "1"]
++_UB_MIN_TOKENS = int(os.environ.get("INKLING2_UBATCH_MIN_TOKENS", "1024"))
++_UB_PARTS = int(os.environ.get("INKLING2_UBATCH_PARTS", "2"))
++
++
++@eager_break_during_capture
++def _ub_ar_launch(x, out, ev_start, ev_done, side) -> None:
++    """Start the all-reduce of `x` into `out` on `side` after the main stream's
++    work so far; runs eagerly (also on graph replay) so it can stay in flight."""
++    main = torch.cuda.current_stream()
++    ev_start.record(main)
++    side.wait_event(ev_start)
++    with torch.cuda.stream(side):
++        ink_all_reduce_into(x, out)
++        ev_done.record(side)
++
++
++@eager_break_during_capture
++def _ub_ar_wait(out, ev_done) -> None:
++    torch.cuda.current_stream().wait_event(ev_done)
++
+ class Inkling2RMSNorm(nn.Module):
+     """RMSNorm; `num_inputs > 1` stacks the weights of per-input norms (the
+     block AttnRes mixes apply them in the same kernel)."""
+@@ -208,11 +235,13 @@ class Inkling2DecoderLayer(nn.Module):
+         inputs: Sequence[torch.Tensor],
+         tau: torch.Tensor | None,
+         out: torch.Tensor | None = None,
++        ub: int = 0,
++        bounds: tuple = (),
+     ) -> torch.Tensor:
+         """This rank's partial attention output on the normalized `inputs`."""
+         if self.is_local:
+-            return self.attn(positions, inputs[0], out=out)
+-        return self.attn(positions, inputs[0], inputs[1], inputs[2], tau, out)
++            return self.attn(positions, inputs[0], out=out, ub=ub, bounds=bounds)
++        return self.attn(positions, inputs[0], inputs[1], inputs[2], tau, out, ub=ub, bounds=bounds)
+ 
+ 
+ class Inkling2Model(nn.Module):
+@@ -242,6 +271,7 @@ class Inkling2Model(nn.Module):
+         self.allreduce_workspace = None
+         self.seq_parallel = None
+         if get_tensor_model_parallel_world_size() > 1:
++            init_host_all_reduce()
+             assert self.normalize_values
+             group = get_tp_group().cpu_group
+             self.allreduce_workspace = Inkling2AllReduceWorkspace.create(
+@@ -262,7 +292,13 @@ class Inkling2Model(nn.Module):
+         self.aux_hidden_state_layers: tuple[int, ...] = ()
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        return self.embed_norm(self.embed_tokens(input_ids))
++        if self.embed_tokens.tp_size > 1 and self.embed_tokens.reduce_results:
++            # Reduce through ink_all_reduce (host-mapped for decode sizes).
++            self.embed_tokens.reduce_results = False
++        out = self.embed_tokens(input_ids)
++        if self.embed_tokens.tp_size > 1:
++            out = ink_all_reduce(out.contiguous())
++        return self.embed_norm(out)
+ 
+     def _mix(
+         self,
+@@ -276,10 +312,132 @@ class Inkling2Model(nn.Module):
+             stack, last, addend, query, norm.weight, norm.eps, self.normalize_values
+         )
+ 
++    def _ar_async(self, key, x, main, side):
++        """Launch the all-reduce of `x` (eager break); returns a handle for
++        `_ar_get`. `x` and the output stay referenced by the handle, so the
++        graph pool cannot reuse their memory while the copy is in flight."""
++        evs = self.__dict__.setdefault("_ub_events", {})
++        if key not in evs:
++            evs[key] = (torch.cuda.Event(), torch.cuda.Event())
++        ev_start, ev_done = evs[key]
++        x = x.contiguous()
++        out = torch.empty_like(x)
++        _ub_ar_launch(x, out, ev_start, ev_done, side)
++        return (x, out, ev_done)
++
++    def _ar_get(self, handle):
++        x, out, ev_done = handle
++        _ub_ar_wait(out, ev_done)
++        return out
++
++    def _forward_ubatch(self, positions, inputs_embeds):
++        """Prefill as N row parts (default 3) on a staggered schedule. Per layer a
++        part runs two stages: P = previous layer's mlp sconv + this layer's
++        attention, Q = attn sconv + mix + experts. At step t part k runs its stage
++        t - k, so each all-reduce is consumed only after one P and one Q of the
++        other parts, and for every layer and conv stream part k's state update
++        precedes part k + 1's read. The eager breaks split the step's metadata
++        per part (ubatch.py); a part past the last real token is skipped there."""
++        n, hidden = inputs_embeds.shape
++        parts = max(2, _UB_PARTS)
++        bounds = tuple(int(round(n * k / parts / 64)) * 64 for k in range(1, parts))
++        edges = (0, *bounds, n)
++        rows = [slice(edges[k], edges[k + 1]) for k in range(parts)]
++        main = torch.cuda.current_stream()
++        side = self.__dict__.get("_ub_side")
++        if side is None:
++            # High priority: the all-reduce reduction kernel runs here and must
++            # not wait behind the other parts GEMMs for free SMs.
++            side = self.__dict__["_ub_side"] = torch.cuda.Stream(
++                priority=int(os.environ.get("INKLING2_UB_SIDE_PRIO", "-1")))
++        num_layers = len(self.layers)
++        max_blocks = -(-num_layers // self.block_size)
++        stack = inputs_embeds.new_empty((max_blocks + 1, n, hidden))
++        stack[0].copy_(inputs_embeds)
++        tau = None
++        if self.config.log_scaling_n_floor is not None:
++            tau = compute_log_scaling_tau(
++                positions, self.config.log_scaling_n_floor, self.config.log_scaling_alpha)
++        nb_before, nb = [], 0
++        for i in range(num_layers):
++            nb_before.append(nb)
++            if i % self.block_size == 0:
++                nb += 1
++        state = [dict() for _ in range(parts)]
++        # DSpark target features: the partial block entering each aux layer.
++        aux_index = {l: k for k, l in enumerate(l for l in self.aux_hidden_state_layers if l < num_layers)}
++        aux = stack.new_empty((len(aux_index), n, hidden)) if aux_index else None
++
++        def s1(mb, i):
++            layer, r, nbi = self.layers[i], rows[mb], nb_before[i]
++            partial = stack[nbi, r]
++            if i in aux_index:
++                aux[aux_index[i], r].copy_(partial)
++            if nbi == 0:
++                inputs = [layer.attn_norm(partial, j) for j in range(layer.num_attn_inputs)]
++            else:
++                inputs = self._mix(stack[:nbi, r], partial, self.attn_res.attn_queries[i - 1], layer.attn_norm)
++            ap = layer.attention(positions[r], inputs, None if tau is None else tau[r], ub=mb + 1, bounds=bounds)
++            state[mb]["attn"] = self._ar_async((i, mb, 0), ap, main, side)
++
++        def s2(mb, i):
++            layer, r, nbi = self.layers[i], rows[mb], nb_before[i]
++            red = self._ar_get(state[mb]["attn"])
++            attn_out = layer.attn_sconv(red, positions[r], ub=mb + 1, bounds=bounds)
++            if i % self.block_size == 0:
++                mlp_in = self._mix(stack[: nbi + 1, r], attn_out, self.attn_res.mlp_queries[i], layer.mlp_norm)
++            else:
++                mlp_in = self._mix(stack[:nbi, r], stack[nbi, r], self.attn_res.mlp_queries[i],
++                                   layer.mlp_norm, attn_out)
++            x = mlp_in[0].contiguous()
++            w, ids = layer.mlp.route(x)
++            mo = layer.mlp.experts(x, w, ids).to(x.dtype)
++            state[mb]["attn_out"] = attn_out
++            state[mb]["moe"] = self._ar_async((i, mb, 1), mo, main, side)
++
++        def s3(mb, i):
++            layer, r, nbi = self.layers[i], rows[mb], nb_before[i]
++            red = self._ar_get(state[mb]["moe"])
++            first = i % self.block_size == 0
++            layer.mlp_sconv(red, positions[r], addend=state[mb]["attn_out"],
++                            residual=None if first else stack[nbi, r],
++                            out=stack[nbi + 1 if first else nbi, r], ub=mb + 1, bounds=bounds)
++
++        def stage(mb, st):
++            if st % 2 == 0:
++                layer_i = st // 2
++                if layer_i > 0:
++                    s3(mb, layer_i - 1)
++                if layer_i < num_layers:
++                    s1(mb, layer_i)
++            else:
++                s2(mb, st // 2)
++
++        num_stages = 2 * num_layers + 1
++        for t in range(num_stages + parts - 1):
++            for mb in range(parts):
++                st = t - mb
++                if 0 <= st < num_stages:
++                    stage(mb, st)
++        out = self._mix(stack[:nb], stack[nb], self.attn_res.output_query, self.norm)[0]
++        if self.aux_hidden_state_layers:
++            return out, [*aux.unbind(0), out]
++        return out
++
+     def forward(
+         self, positions: torch.Tensor, inputs_embeds: torch.Tensor
+     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+         num_tokens, hidden = inputs_embeds.shape
++        if (
++            _UB_OVERLAP[0]
++            and num_tokens >= _UB_MIN_TOKENS
++            and get_tensor_model_parallel_world_size() > 1
++            and self.seq_parallel is None
++            and self.allreduce_workspace is None
++        ):
++            out = self._forward_ubatch(positions, inputs_embeds)
++            if out is not None:
++                return out
+         aux_hidden_states = []
+         num_layers = len(self.layers)
+         # With a conv-state cache (TP > 1), the hidden-stream conv runs fused
+diff --git a/vllm/models/inkling2/ops/dma_allreduce.py b/vllm/models/inkling2/ops/dma_allreduce.py
+new file mode 100644
+index 000000000..100a99204
+--- /dev/null
++++ b/vllm/models/inkling2/ops/dma_allreduce.py
+@@ -0,0 +1,320 @@
++"""Host-staged copy-engine all-reduce for large (prefill) tensors on PCIe nodes without P2P.
++
++NCCL's SHM transport tops out at ~9.35 GB/s algbw on ampere (3x RTX PRO 6000, x16 Gen4,
++no peer access) while each GPU's copy engines sustain ~25.5 GB/s D2H and ~28.5 GB/s H2D
++concurrently. This runs a reduce-scatter + all-gather through one shared, registered host
++buffer with the data plane on copy engines and the cross-process handshake on stream memory
++operations (cuStreamWriteValue64 / cuStreamWaitValue64 on host-mapped 64-bit flags carrying
++a per-call epoch), so the host never blocks.
++
++Per call (S elements, owner shards of S/W, P pieces each), rank r:
++  d2h stream : copy x[o-shard piece] -> host in[r]   ; write flag_in[r][o][p] = epoch
++  h2d stream : wait flag_in[peer][r][p]  ; copy host in[peer][r-shard piece] -> scratch
++  main stream: out[r-shard piece] = x + scratch0 + scratch1 (fp32 accumulate, rank order)
++  d2h stream : copy out[r-shard piece] -> host red ; write flag_red[r][p] = epoch
++  h2d stream : wait flag_red[o][p] ; copy host red[o-shard piece] -> out
++Slot reuse is safe without double buffering: rank r only starts writing call e+1 after it saw
++every owner's flag_red for call e, i.e. after every owner finished reading in[r] for call e.
++"""
++from __future__ import annotations
++
++import ctypes
++import mmap
++import os
++import uuid
++
++import torch
++import torch.distributed as dist
++
++_SRC = r"""
++#include <torch/extension.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda.h>
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <vector>
++
++#define CK(x) do { cudaError_t _ck_err = (x); TORCH_CHECK(_ck_err == cudaSuccess, #x, ": ", cudaGetErrorString(_ck_err)); } while (0)
++#define CKD(x) do { CUresult _ckd_err = (x); TORCH_CHECK(_ckd_err == CUDA_SUCCESS, #x, " failed: ", (int)_ckd_err); } while (0)
++
++__global__ void sum3_bf16(const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
++                          const __nv_bfloat16* __restrict__ c, __nv_bfloat16* __restrict__ o,
++                          const int* order, long n) {
++    // rank-order fp32 accumulation: order[k] picks a/b/c for summand k
++    long i = (blockIdx.x * (long)blockDim.x + threadIdx.x) * 8;
++    if (i >= n) return;
++    const __nv_bfloat16* src[3] = {a, b, c};
++    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    for (int k = 0; k < 3; ++k) {
++        int4 v = *(const int4*)(src[order[k]] + i);
++        const __nv_bfloat16* h = (const __nv_bfloat16*)&v;
++        #pragma unroll
++        for (int j = 0; j < 8; ++j) acc[j] += __bfloat162float(h[j]);
++    }
++    int4 r; __nv_bfloat16* rh = (__nv_bfloat16*)&r;
++    #pragma unroll
++    for (int j = 0; j < 8; ++j) rh[j] = __float2bfloat16(acc[j]);
++    *(int4*)(o + i) = r;
++}
++
++struct State {
++    std::vector<cudaEvent_t> ev;
++    int* order_dev = nullptr;
++};
++static State g;
++
++static cudaEvent_t ev(int i) {
++    while ((int)g.ev.size() <= i) {
++        cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); g.ev.push_back(e);
++    }
++    return g.ev[i];
++}
++
++int64_t host_register(int64_t ptr, int64_t size) {
++    CK(cudaHostRegister((void*)ptr, size, cudaHostRegisterMapped | cudaHostRegisterPortable));
++    void* d = nullptr;
++    CK(cudaHostGetDevicePointer(&d, (void*)ptr, 0));
++    return (int64_t)d;
++}
++
++// host_in: base host ptr of in-slots [W][cap] bf16 ; host_red: [cap] bf16 ; flags: uint64 array
++// flag layout: in[src][owner][p] at ((src*W+owner)*P+p)*8 ; red[owner][p] at (W*W*P + owner*P + p)*8 (x8 u64 stride)
++void dma_allreduce(torch::Tensor x, torch::Tensor out, torch::Tensor scratch, int64_t host_in, int64_t host_red,
++                   int64_t flags_dev, int64_t cap, int64_t rank, int64_t world, int64_t epoch, int64_t P,
++                   int64_t s_d2h_i, int64_t s_h2d_i, int64_t s_d2h2_i, int64_t s_h2d2_i, torch::Tensor order) {
++    TORCH_CHECK(world == 3, "dma_allreduce: world 3 only");
++    const long n = x.numel();
++    TORCH_CHECK(n % (world * P * 8) == 0 && n <= cap, "dma_allreduce: bad size");
++    const long sh = n / world, pc = sh / P;
++    const size_t pcb = pc * 2;
++    cudaStream_t main = c10::cuda::getCurrentCUDAStream();
++    cudaStream_t sd = (cudaStream_t)s_d2h_i, su = (cudaStream_t)s_h2d_i;
++    cudaStream_t sd2 = (cudaStream_t)s_d2h2_i, su2 = (cudaStream_t)s_h2d2_i;  // reduced-shard D2H / gather H2D
++    char* xin = (char*)x.data_ptr(); char* xo = (char*)out.data_ptr(); char* scr = (char*)scratch.data_ptr();
++    char* hin = (char*)host_in; char* hred = (char*)host_red;
++    auto fin = [&](long src, long own, long p) { return (CUdeviceptr)(flags_dev + (((src * world + own) * P + p) * 8) * 8); };
++    auto fred = [&](long own, long p) { return (CUdeviceptr)(flags_dev + ((world * world * P + own * P + p) * 8) * 8); };
++    int e = 0;
++    // input ready; every copy stream joins (the previous call's reads of `scratch` / slots are done)
++    CK(cudaEventRecord(ev(e), main));
++    for (cudaStream_t st : {sd, su, sd2, su2}) CK(cudaStreamWaitEvent(st, ev(e), 0));
++    ++e;
++    // 1) publish the peers' shards of my partial (my own shard never leaves the GPU)
++    for (long k = 1; k < world; ++k) {
++        long o = (rank + k) % world;
++        for (long p = 0; p < P; ++p) {
++            long off = (o * sh + p * pc) * 2;
++            CK(cudaMemcpyAsync(hin + rank * cap * 2 + off, xin + off, pcb, cudaMemcpyDeviceToHost, sd));
++            if (o != rank) CKD(cuStreamWriteValue64((CUstream)sd, fin(rank, o, p), (cuuint64_t)epoch, 0));
++        }
++    }
++    // 2-4) owner reduce of shard `rank`
++    long peers[2] = {(rank + 1) % world, (rank + 2) % world};
++    // summation in rank order: build order mapping {own->0, peers[0]->1, peers[1]->2} sorted by rank
++    for (long p = 0; p < P; ++p) {
++        long off = (rank * sh + p * pc) * 2;
++        for (int i = 0; i < 2; ++i) {
++            CKD(cuStreamWaitValue64((CUstream)su, fin(peers[i], rank, p), (cuuint64_t)epoch, CU_STREAM_WAIT_VALUE_GEQ));
++            CK(cudaMemcpyAsync(scr + (i * sh + p * pc) * 2, hin + peers[i] * cap * 2 + off, pcb, cudaMemcpyHostToDevice, su));
++        }
++        CK(cudaEventRecord(ev(e), su)); CK(cudaStreamWaitEvent(main, ev(e), 0)); ++e;
++        long nn = pc; int threads = 256; long blocks = (nn / 8 + threads - 1) / threads;
++        sum3_bf16<<<blocks, threads, 0, main>>>((const __nv_bfloat16*)(xin + off),
++            (const __nv_bfloat16*)(scr + (0 * sh + p * pc) * 2), (const __nv_bfloat16*)(scr + (1 * sh + p * pc) * 2),
++            (__nv_bfloat16*)(xo + off), order.data_ptr<int>(), nn);
++        CK(cudaGetLastError());
++        CK(cudaEventRecord(ev(e), main)); CK(cudaStreamWaitEvent(sd2, ev(e), 0)); ++e;
++        CK(cudaMemcpyAsync(hred + off, xo + off, pcb, cudaMemcpyDeviceToHost, sd2));
++        CKD(cuStreamWriteValue64((CUstream)sd2, fred(rank, p), (cuuint64_t)epoch, 0));
++    }
++    // 5) gather the other owners' reduced shards
++    for (int i = 0; i < 2; ++i) {
++        long o = peers[i];
++        for (long p = 0; p < P; ++p) {
++            long off = (o * sh + p * pc) * 2;
++            CKD(cuStreamWaitValue64((CUstream)su2, fred(o, p), (cuuint64_t)epoch, CU_STREAM_WAIT_VALUE_GEQ));
++            CK(cudaMemcpyAsync(xo + off, hred + off, pcb, cudaMemcpyHostToDevice, su2));
++        }
++    }
++    // 6) join copy streams back into main
++    // gather writes `out` on su2 must not start before main's reduce of my shard (disjoint ranges,
++    // but out is the same allocation) -- disjoint, so only join here.
++    for (cudaStream_t st : {sd, su, sd2, su2}) {
++        CK(cudaEventRecord(ev(e), st)); CK(cudaStreamWaitEvent(main, ev(e), 0)); ++e;
++    }
++}
++
++__device__ __forceinline__ unsigned long long ld_vol_u64(const unsigned long long* p) {
++    unsigned long long v; asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(v) : "l"(p)); return v;
++}
++__global__ void bump_epoch_kernel(unsigned long long* ep) { *ep += 1ull; }
++__global__ void flag_write_kernel(unsigned long long* flag, const unsigned long long* ep) {
++    __threadfence_system();
++    *(volatile unsigned long long*)flag = *ep;
++    __threadfence_system();
++}
++__global__ void flag_wait_kernel(const unsigned long long* flag, const unsigned long long* ep) {
++    const unsigned long long e = *ep;
++    while (ld_vol_u64(flag) < e) { }
++    __threadfence_system();
++}
++
++// Graph-capturable variant: epoch is device state (bumped per call, also on replay).
++void dma_allreduce_g(torch::Tensor x, torch::Tensor out, torch::Tensor scratch, int64_t host_in, int64_t host_red,
++                     int64_t flags_dev, int64_t cap, int64_t rank, int64_t world, torch::Tensor ep, torch::Tensor order,
++                     int64_t P, int64_t s_d2h_i, int64_t s_h2d_i, int64_t s_d2h2_i, int64_t s_h2d2_i) {
++    TORCH_CHECK(world == 3, "dma_allreduce: world 3 only");
++    const long n = x.numel();
++    TORCH_CHECK(n % (world * P * 8) == 0 && n <= cap, "dma_allreduce: bad size");
++    const long sh = n / world, pc = sh / P;
++    const size_t pcb = pc * 2;
++    cudaStream_t main = c10::cuda::getCurrentCUDAStream();
++    cudaStream_t sd = (cudaStream_t)s_d2h_i, su = (cudaStream_t)s_h2d_i;
++    cudaStream_t sd2 = (cudaStream_t)s_d2h2_i, su2 = (cudaStream_t)s_h2d2_i;
++    char* xin = (char*)x.data_ptr(); char* xo = (char*)out.data_ptr(); char* scr = (char*)scratch.data_ptr();
++    char* hin = (char*)host_in; char* hred = (char*)host_red;
++    unsigned long long* epd = (unsigned long long*)ep.data_ptr();
++    auto fin = [&](long src, long own, long p) { return (unsigned long long*)(flags_dev + (((src * world + own) * P + p) * 8) * 8); };
++    auto fred = [&](long own, long p) { return (unsigned long long*)(flags_dev + ((world * world * P + own * P + p) * 8) * 8); };
++    int e = 0;
++    bump_epoch_kernel<<<1, 1, 0, main>>>(epd);
++    CK(cudaEventRecord(ev(e), main));
++    for (cudaStream_t st : {sd, su, sd2, su2}) CK(cudaStreamWaitEvent(st, ev(e), 0));
++    ++e;
++    for (long k = 1; k < world; ++k) {
++        long o = (rank + k) % world;
++        for (long p = 0; p < P; ++p) {
++            long off = (o * sh + p * pc) * 2;
++            CK(cudaMemcpyAsync(hin + rank * cap * 2 + off, xin + off, pcb, cudaMemcpyDeviceToHost, sd));
++            flag_write_kernel<<<1, 1, 0, sd>>>(fin(rank, o, p), epd);
++        }
++    }
++    long peers[2] = {(rank + 1) % world, (rank + 2) % world};
++    for (long p = 0; p < P; ++p) {
++        long off = (rank * sh + p * pc) * 2;
++        for (int i = 0; i < 2; ++i) {
++            flag_wait_kernel<<<1, 1, 0, su>>>(fin(peers[i], rank, p), epd);
++            CK(cudaMemcpyAsync(scr + (i * sh + p * pc) * 2, hin + peers[i] * cap * 2 + off, pcb, cudaMemcpyHostToDevice, su));
++        }
++        CK(cudaEventRecord(ev(e), su)); CK(cudaStreamWaitEvent(main, ev(e), 0)); ++e;
++        long nn = pc; int threads = 256; long blocks = (nn / 8 + threads - 1) / threads;
++        sum3_bf16<<<blocks, threads, 0, main>>>((const __nv_bfloat16*)(xin + off),
++            (const __nv_bfloat16*)(scr + (0 * sh + p * pc) * 2), (const __nv_bfloat16*)(scr + (1 * sh + p * pc) * 2),
++            (__nv_bfloat16*)(xo + off), order.data_ptr<int>(), nn);
++        CK(cudaGetLastError());
++        CK(cudaEventRecord(ev(e), main)); CK(cudaStreamWaitEvent(sd2, ev(e), 0)); ++e;
++        CK(cudaMemcpyAsync(hred + off, xo + off, pcb, cudaMemcpyDeviceToHost, sd2));
++        flag_write_kernel<<<1, 1, 0, sd2>>>(fred(rank, p), epd);
++    }
++    for (int i = 0; i < 2; ++i) {
++        long o = peers[i];
++        for (long p = 0; p < P; ++p) {
++            long off = (o * sh + p * pc) * 2;
++            flag_wait_kernel<<<1, 1, 0, su2>>>(fred(o, p), epd);
++            CK(cudaMemcpyAsync(xo + off, hred + off, pcb, cudaMemcpyHostToDevice, su2));
++        }
++    }
++    for (cudaStream_t st : {sd, su, sd2, su2}) {
++        CK(cudaEventRecord(ev(e), st)); CK(cudaStreamWaitEvent(main, ev(e), 0)); ++e;
++    }
++    CK(cudaGetLastError());
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("dma_allreduce", &dma_allreduce);
++    m.def("dma_allreduce_g", &dma_allreduce_g);
++    m.def("host_register", &host_register);
++}
++"""
++
++_ext = None
++
++
++def _load():
++    global _ext
++    if _ext is None:
++        from torch.utils.cpp_extension import load_inline
++        _ext = load_inline("ink_dma_allreduce_g2", cpp_sources="", cuda_sources=_SRC,
++                           extra_cuda_cflags=["-O3"], extra_ldflags=["-lcuda"],
++                           build_directory=os.environ.get("INK_DMA_BUILD", None), verbose=False)
++    return _ext
++
++
++class DmaAllReduce:
++    """Per-TP-group instance (world 3). Tensors of bf16, numel % (3 * P * 8) == 0, <= cap."""
++
++    def __init__(self, cpu_group, rank: int, world: int, device: torch.device,
++                 cap_elems: int = 8192 * 4608, pieces: int = 4):
++        assert world == 3
++        self.rank, self.world, self.cap, self.P = rank, world, cap_elems, pieces
++        ext = _load()
++        name = [f"/ink_dma_{uuid.uuid4().hex[:12]}" if rank == 0 else None]
++        dist.broadcast_object_list(name, src=0, group=cpu_group)
++        # two flag regions: eager stream-memop path, then the graph-safe (device epoch) path
++        self.flag_region = (world * world * pieces + world * pieces) * 64
++        self.flag_bytes = 2 * self.flag_region + 4096
++        self.in_bytes = world * cap_elems * 2
++        size = self.flag_bytes + self.in_bytes + cap_elems * 2
++        path = "/dev/shm" + name[0]
++        if rank == 0:
++            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
++            os.ftruncate(fd, size)
++            os.close(fd)
++        dist.barrier(group=cpu_group)
++        fd = os.open(path, os.O_RDWR)
++        self.mm = mmap.mmap(fd, size)
++        os.close(fd)
++        dist.barrier(group=cpu_group)
++        if rank == 0:
++            os.unlink(path)
++        buf = (ctypes.c_char * size).from_buffer(self.mm)
++        self._buf = buf
++        hp = ctypes.addressof(buf)
++        with torch.cuda.device(device):
++            dptr = ext.host_register(hp, size)
++        # flags via the device pointer; copies via host pointers (UVA)
++        self.flags_dev = dptr
++        self.host_in = hp + self.flag_bytes
++        self.host_red = hp + self.flag_bytes + self.in_bytes
++        self.epoch = 0
++        self.ep = torch.zeros(1, dtype=torch.int64, device=device)
++        peers = [(rank + 1) % world, (rank + 2) % world]
++        self.order = torch.tensor([0 if r == rank else (1 if r == peers[0] else 2) for r in range(world)],
++                                  dtype=torch.int32, device=device)
++        self.use_graph_safe = os.environ.get("INK_DMA_GRAPH_SAFE", "1") == "1"
++        self.s_d2h = torch.cuda.Stream(device=device)
++        self.s_h2d = torch.cuda.Stream(device=device)
++        self.s_d2h2 = torch.cuda.Stream(device=device)
++        self.s_h2d2 = torch.cuda.Stream(device=device)
++        self.scratch = torch.empty(2 * (cap_elems // world), dtype=torch.bfloat16, device=device)
++        self.ext = ext
++        dist.barrier(group=cpu_group)
++
++    def ok(self, x: torch.Tensor) -> bool:
++        return (x.dtype == torch.bfloat16 and x.is_contiguous() and x.numel() <= self.cap
++                and x.numel() % (self.world * self.P * 8) == 0)
++
++    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
++        out = torch.empty_like(x) if out is None else out
++        if self.use_graph_safe and torch.cuda.is_current_stream_capturing():
++            self.ext.dma_allreduce_g(x, out, self.scratch, self.host_in, self.host_red, self.flags_dev + self.flag_region,
++                                     self.cap, self.rank, self.world, self.ep, self.order, self.P,
++                                     self.s_d2h.cuda_stream, self.s_h2d.cuda_stream,
++                                     self.s_d2h2.cuda_stream, self.s_h2d2.cuda_stream)
++            if not torch.cuda.is_current_stream_capturing():
++                x.record_stream(self.s_d2h)
++                for st in (self.s_d2h2, self.s_h2d2):
++                    out.record_stream(st)
++            return out
++        # Eager: stream memops for the flags (no SM needed); the graph-safe path
++        # keeps its own flag region with a device-side epoch.
++        self.epoch += 1
++        self.ext.dma_allreduce(x, out, self.scratch, self.host_in, self.host_red, self.flags_dev,
++                               self.cap, self.rank, self.world, self.epoch, self.P,
++                               self.s_d2h.cuda_stream, self.s_h2d.cuda_stream,
++                               self.s_d2h2.cuda_stream, self.s_h2d2.cuda_stream, self.order)
++        # x / out / scratch are used on the copy streams: keep them alive until those finish
++        x.record_stream(self.s_d2h)
++        for st in (self.s_d2h2, self.s_h2d2):
++            out.record_stream(st)
++        return out
+diff --git a/vllm/models/inkling2/ops/host_allreduce.py b/vllm/models/inkling2/ops/host_allreduce.py
+new file mode 100644
+index 000000000..676c3d082
+--- /dev/null
++++ b/vllm/models/inkling2/ops/host_allreduce.py
+@@ -0,0 +1,287 @@
++"""One-shot small-tensor all-reduce through shared, mapped pinned host memory.
++
++For single-node TP groups without GPU peer-to-peer (ampere: no P2P on its PCIe fabric), NCCL
++falls back to SHM/proxy transports whose small-message latency is ~100 us. Here each rank's GPU
++writes its partial straight into a POSIX shared-memory segment that every process registered
++with cudaHostRegister(Mapped|Portable), raises a flag, spins until all peers' flags show the
++same epoch, then sums the peers' slots (in rank order, fp32) into its output.
++
++The epoch lives in device memory and is advanced by the kernel itself, so the op is CUDA-graph
++capturable/replayable as long as every rank issues the same sequence of calls (true for TP).
++Two data slots (by epoch parity) suffice: a rank only reaches epoch e+2 after every peer
++published e+1, which each did only after finishing its reads of epoch e.
++"""
++from __future__ import annotations
++
++import ctypes
++import mmap
++import os
++import uuid
++
++import torch
++import torch.distributed as dist
++
++_SRC = r"""
++#include <torch/extension.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#define MAXR 8
++
++struct Ptrs { const unsigned long long* flags; char* data; };
++
++__device__ __forceinline__ int4 ld_cv4(const void* p) {
++    int4 v;
++    asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
++    return v;
++}
++__device__ __forceinline__ float to_f(__nv_bfloat16 x) { return __bfloat162float(x); }
++__device__ __forceinline__ float to_f(__half x) { return __half2float(x); }
++template <typename T> __device__ __forceinline__ T from_f(float x);
++template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float x) { return __float2bfloat16(x); }
++template <> __device__ __forceinline__ __half from_f<__half>(float x) { return __float2half(x); }
++
++__device__ __forceinline__ unsigned long long ld_volatile(const unsigned long long* p) {
++    unsigned long long v; asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(v) : "l"(p)); return v;
++}
++
++// One CTA per 'chunk' of the vector; CTA 0 thread 0 owns the flag protocol, with a
++// grid-wide handshake through a device counter so every CTA's stores are visible first.
++template <typename T>
++__global__ void host_ar_kernel(const T* __restrict__ in, T* __restrict__ out, long n,
++                               unsigned long long* flags, char* data, long slot_bytes,
++                               int rank, int world, unsigned long long* epoch_ptr,
++                               unsigned int* arrive, unsigned int* depart) {
++    __shared__ unsigned long long epoch;
++    if (threadIdx.x == 0) epoch = *epoch_ptr + 1;
++    __syncthreads();
++    const unsigned long long e = epoch;
++    const int par = (int)(e & 1ull);
++    T* mine = (T*)(data + ((long)par * world + rank) * slot_bytes);
++    // 1) publish my partial (16-byte vectors)
++    const long nv = n * (long)sizeof(T) / 16;
++    const int4* src = (const int4*)in;
++    int4* dst = (int4*)mine;
++    for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < nv; i += (long)gridDim.x * blockDim.x)
++        dst[i] = src[i];
++    __threadfence_system();
++    __syncthreads();
++    // grid barrier #1 (all CTAs stored) -> CTA 0 raises the flag
++    if (threadIdx.x == 0) {
++        unsigned int t = atomicAdd(arrive, 1u) + 1u;
++        if (blockIdx.x == 0) {
++            while (t % gridDim.x != 0) t = atomicAdd(arrive, 0u);
++            __threadfence_system();
++            *((volatile unsigned long long*)(flags + rank * 16)) = e;
++            __threadfence_system();
++            // wait for every peer to publish this epoch
++            for (int r = 0; r < world; ++r)
++                while (ld_volatile(flags + r * 16) < e) { }
++            __threadfence_system();
++            atomicAdd(depart, 1u);
++        } else {
++            unsigned int d0;
++            // spin until CTA 0 has seen all peers for this call
++            do { d0 = atomicAdd(depart, 0u); } while (d0 < (unsigned int)(e));
++        }
++    }
++    __syncthreads();
++    // 3) sum all slots in rank order (fp32), write output
++    const long nvec = n / 8;  // 8 x 16-bit per int4
++    for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < nvec; i += (long)gridDim.x * blockDim.x) {
++        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++        for (int r = 0; r < world; ++r) {
++            const int4 v = ld_cv4((const int4*)(data + ((long)par * world + r) * slot_bytes) + i);
++            const T* h = (const T*)&v;
++            #pragma unroll
++            for (int j = 0; j < 8; ++j) acc[j] += to_f(h[j]);
++        }
++        int4 o; T* oh = (T*)&o;
++        #pragma unroll
++        for (int j = 0; j < 8; ++j) oh[j] = from_f<T>(acc[j]);
++        ((int4*)out)[i] = o;
++    }
++    __syncthreads();
++    if (blockIdx.x == 0 && threadIdx.x == 0) *epoch_ptr = e;
++}
++
++void host_all_reduce(torch::Tensor in, torch::Tensor out, int64_t flags, int64_t data, int64_t slot_bytes,
++                     int64_t rank, int64_t world, torch::Tensor epoch, torch::Tensor arrive,
++                     torch::Tensor depart, int64_t blocks) {
++    auto stream = c10::cuda::getCurrentCUDAStream();
++    long n = in.numel();
++    TORCH_CHECK(n % 8 == 0 && in.is_contiguous() && out.is_contiguous());
++    TORCH_CHECK((long)n * 2 <= slot_bytes);
++    if (in.scalar_type() == at::kBFloat16)
++        host_ar_kernel<__nv_bfloat16><<<blocks, 512, 0, stream>>>(
++            (const __nv_bfloat16*)in.data_ptr(), (__nv_bfloat16*)out.data_ptr(), n,
++            (unsigned long long*)flags, (char*)data, slot_bytes, rank, world,
++            (unsigned long long*)epoch.data_ptr(), (unsigned int*)arrive.data_ptr(),
++            (unsigned int*)depart.data_ptr());
++    else
++        host_ar_kernel<__half><<<blocks, 512, 0, stream>>>(
++            (const __half*)in.data_ptr(), (__half*)out.data_ptr(), n,
++            (unsigned long long*)flags, (char*)data, slot_bytes, rank, world,
++            (unsigned long long*)epoch.data_ptr(), (unsigned int*)arrive.data_ptr(),
++            (unsigned int*)depart.data_ptr());
++}
++
++// ---- LL protocol (NCCL "LL"-style): every 8-byte word = 4 data bytes | 32-bit epoch. Readers spin on
++// the words themselves, so there is no system fence and no separate flag round trip. One thread per
++// word, so all reads go out at once. The own partial is taken from device memory. Epoch slots alternate
++// by parity: a rank only writes epoch e+2 after reading every peer's e+1 words, which each peer wrote
++// only after finishing its reads of epoch e. The last CTA to finish advances the epoch (every CTA has
++// read it by then).
++__device__ __forceinline__ void st_volatile_u64(unsigned long long* p, unsigned long long v) {
++    asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
++}
++
++template <typename T, int WORLD>
++__global__ void host_ar_ll_kernel(const T* __restrict__ in, T* __restrict__ out, long nw,
++                                  unsigned long long* ll, long slot_words, int rank,
++                                  unsigned long long* epoch_ptr, unsigned int* done) {
++    const unsigned int e = (unsigned int)(*epoch_ptr + 1ull);
++    const int par = (int)(e & 1u);
++    const long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
++    if (i < nw) {
++        const unsigned int mine = ((const unsigned int*)in)[i];
++        st_volatile_u64(ll + ((long)par * WORLD + rank) * slot_words + i,
++                        (unsigned long long)mine | ((unsigned long long)e << 32));
++        unsigned int vals[WORLD];
++        bool ready[WORLD];
++        #pragma unroll
++        for (int r = 0; r < WORLD; ++r) { ready[r] = (r == rank); vals[r] = mine; }
++        bool all = false;
++        while (!all) {
++            all = true;
++            #pragma unroll
++            for (int r = 0; r < WORLD; ++r) {
++                if (!ready[r]) {
++                    const unsigned long long w = ld_volatile(ll + ((long)par * WORLD + r) * slot_words + i);
++                    if ((unsigned int)(w >> 32) == e) { ready[r] = true; vals[r] = (unsigned int)w; }
++                    else all = false;
++                }
++            }
++        }
++        float a0 = 0.f, a1 = 0.f;
++        #pragma unroll
++        for (int r = 0; r < WORLD; ++r) {
++            const T* h = (const T*)&vals[r];
++            a0 += to_f(h[0]); a1 += to_f(h[1]);
++        }
++        T o[2] = {from_f<T>(a0), from_f<T>(a1)};
++        ((unsigned int*)out)[i] = *(const unsigned int*)o;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence();
++        if (atomicAdd(done, 1u) == gridDim.x - 1) { *done = 0u; *epoch_ptr = e; }
++    }
++}
++
++void host_all_reduce_ll(torch::Tensor in, torch::Tensor out, int64_t ll, int64_t slot_words,
++                        int64_t rank, int64_t world, torch::Tensor epoch, torch::Tensor done) {
++    auto stream = c10::cuda::getCurrentCUDAStream();
++    long n = in.numel();
++    TORCH_CHECK(n % 2 == 0 && in.is_contiguous() && out.is_contiguous() && world == 3);
++    long nw = n / 2;
++    TORCH_CHECK(nw <= slot_words);
++    int threads = 256; int blocks = (int)((nw + threads - 1) / threads);
++    if (in.scalar_type() == at::kBFloat16)
++        host_ar_ll_kernel<__nv_bfloat16, 3><<<blocks, threads, 0, stream>>>(
++            (const __nv_bfloat16*)in.data_ptr(), (__nv_bfloat16*)out.data_ptr(), nw,
++            (unsigned long long*)ll, slot_words, rank,
++            (unsigned long long*)epoch.data_ptr(), (unsigned int*)done.data_ptr());
++    else
++        host_ar_ll_kernel<__half, 3><<<blocks, threads, 0, stream>>>(
++            (const __half*)in.data_ptr(), (__half*)out.data_ptr(), nw,
++            (unsigned long long*)ll, slot_words, rank,
++            (unsigned long long*)epoch.data_ptr(), (unsigned int*)done.data_ptr());
++}
++
++int64_t host_register(int64_t ptr, int64_t size) {
++    cudaError_t e = cudaHostRegister((void*)ptr, size, cudaHostRegisterMapped | cudaHostRegisterPortable);
++    TORCH_CHECK(e == cudaSuccess, "cudaHostRegister: ", cudaGetErrorString(e));
++    void* d = nullptr;
++    e = cudaHostGetDevicePointer(&d, (void*)ptr, 0);
++    TORCH_CHECK(e == cudaSuccess, "cudaHostGetDevicePointer: ", cudaGetErrorString(e));
++    return (int64_t)d;
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("host_all_reduce", &host_all_reduce);
++    m.def("host_register", &host_register);
++    m.def("host_all_reduce_ll", &host_all_reduce_ll);
++}
++"""
++
++_ext = None
++
++
++def _load():
++    global _ext
++    if _ext is None:
++        from torch.utils.cpp_extension import load_inline
++        _ext = load_inline("ink_host_allreduce_ll", cpp_sources="", cuda_sources=_SRC,
++                           extra_cuda_cflags=["-O3"],
++                           build_directory=os.environ.get("INK_HAR_BUILD", None),
++                           verbose=False)
++    return _ext
++
++
++class HostAllReduce:
++    """Per-TP-group instance. `max_bytes`: largest tensor handled (others -> caller's fallback)."""
++
++    def __init__(self, cpu_group, rank: int, world: int, device: torch.device, max_bytes: int = 256 << 10):
++        self.rank, self.world, self.max_bytes = rank, world, max_bytes
++        ext = _load()
++        name = [f"/ink_har_{uuid.uuid4().hex[:12]}" if rank == 0 else None]
++        dist.broadcast_object_list(name, src=0, group=cpu_group)
++        self.flag_bytes = 128 * 8 * 16
++        self.slot_bytes = max_bytes
++        self.ll_words = self.slot_bytes // 4  # 2 x 16-bit per 8-byte word -> max_bytes / 4 words
++        size = self.flag_bytes + 2 * world * self.slot_bytes + 2 * world * self.ll_words * 8
++        path = "/dev/shm" + name[0]
++        if rank == 0:
++            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
++            os.ftruncate(fd, size)
++            os.close(fd)
++        dist.barrier(group=cpu_group)
++        fd = os.open(path, os.O_RDWR)
++        self.mm = mmap.mmap(fd, size)
++        os.close(fd)
++        dist.barrier(group=cpu_group)
++        if rank == 0:
++            os.unlink(path)  # stays alive while mapped
++        buf = (ctypes.c_char * size).from_buffer(self.mm)
++        host_ptr = ctypes.addressof(buf)
++        self._buf = buf
++        with torch.cuda.device(device):
++            dptr = ext.host_register(host_ptr, size)
++        self.flags = dptr
++        self.data = dptr + self.flag_bytes
++        self.ll = self.data + 2 * world * self.slot_bytes
++        self.ll_done = torch.zeros(1, dtype=torch.int32, device=device)
++        self.ll_epoch = torch.zeros(1, dtype=torch.int64, device=device)
++        self.use_ll = world == 3 and os.environ.get("INK_HAR_LL", "1") == "1"
++        self.epoch = torch.zeros(1, dtype=torch.int64, device=device)
++        self.arrive = torch.zeros(1, dtype=torch.int32, device=device)
++        self.depart = torch.zeros(1, dtype=torch.int32, device=device)
++        self.blocks = int(os.environ.get("INK_HAR_BLOCKS", "1"))
++        self.ext = ext
++        dist.barrier(group=cpu_group)
++
++    def ok(self, x: torch.Tensor) -> bool:
++        return (x.dtype in (torch.bfloat16, torch.float16) and x.is_contiguous()
++                and x.numel() % 8 == 0 and x.numel() * 2 <= self.max_bytes)
++
++    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
++        out = torch.empty_like(x) if out is None else out
++        if self.use_ll:
++            self.ext.host_all_reduce_ll(x, out, self.ll, self.ll_words, self.rank, self.world,
++                                        self.ll_epoch, self.ll_done)
++            return out
++        self.ext.host_all_reduce(x, out, self.flags, self.data, self.slot_bytes, self.rank, self.world,
++                                 self.epoch, self.arrive, self.depart, self.blocks)
++        return out
+diff --git a/vllm/models/inkling2/sconv.py b/vllm/models/inkling2/sconv.py
+index c3b2ae44e..d86c36fea 100644
+--- a/vllm/models/inkling2/sconv.py
++++ b/vllm/models/inkling2/sconv.py
+@@ -17,6 +17,8 @@ from torch import nn
+ 
+ from vllm.distributed import get_tensor_model_parallel_rank
+ from vllm.forward_context import get_forward_context
++
++from .ubatch import step_attn_metadata, ub_scope
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.models.inkling.nvidia.sconv_swa_attn import (
+     InklingConvState,
+@@ -34,7 +36,7 @@ K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
+ 
+ 
+ def conv_metadata(owner):
+-    attn_metadata = get_forward_context().attn_metadata
++    attn_metadata = step_attn_metadata()
+     if not isinstance(attn_metadata, dict):
+         return None
+     if hasattr(owner, "bound"):  # Inkling2ConvState (fixed per-request state)
+@@ -121,17 +123,23 @@ class Inkling2ShortConv(nn.Module):
+         addend: torch.Tensor | None = None,
+         residual: torch.Tensor | None = None,
+         out: torch.Tensor | None = None,
++        ub: int = 0,
++        bounds: tuple = (),
+     ) -> torch.Tensor:
+         """Static conv of `x`; with `addend`, returns `(residual + addend)
+         + conv(x)` accumulated in fp32 (written to `out` if given)."""
+         assert not self.dynamic
+         if out is None:
+             out = torch.empty(x.shape, dtype=x.dtype if addend is None else addend.dtype, device=x.device)
+-        self._forward_into(x, positions, addend, residual, out)
++        self._forward_into(x, positions, addend, residual, out, ub=ub, bounds=bounds)
+         return out
+ 
+     @eager_break_during_capture
+-    def _forward_into(
++    def _forward_into(self, *args, ub: int = 0, bounds: tuple = ()) -> None:
++        with ub_scope(ub, bounds):
++            self._forward_into_body(*args)
++
++    def _forward_into_body(
+         self,
+         x: torch.Tensor,
+         positions: torch.Tensor,
+diff --git a/vllm/models/inkling2/ubatch.py b/vllm/models/inkling2/ubatch.py
+new file mode 100644
+index 000000000..8f3867424
+--- /dev/null
++++ b/vllm/models/inkling2/ubatch.py
+@@ -0,0 +1,225 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Microbatch-aware step metadata for Inkling2's two-microbatch prefill overlap.
++
++The model splits a batch's token rows into parts (`ub` = 1..N) that run
++staggered per layer, so each part's all-reduces overlap the other parts'
++compute. Only the eager graph breaks (attention and the
++stream convs) read per-step metadata; they call `step_attn_metadata()`,
++which returns the full batch's metadata outside a half, and otherwise that
++half's split, derived once per step. The split is generic: decode requests
++(which come first) stay in A, a request straddling `h` is cut in two, and
++the device tensors are derived with GPU ops, so nothing waits on the GPU.
++"""
++from __future__ import annotations
++
++import contextlib
++import dataclasses
++
++import numpy as np
++import torch
++
++from vllm.forward_context import get_forward_context
++
++from . import conv_state as _conv_state
++
++_CUR = [0, ()]  # (part: 0 = whole batch, k >= 1 = k-th part; part boundaries)
++
++
++@contextlib.contextmanager
++def ub_scope(ub: int, bounds: tuple):
++    prev = (_CUR[0], _CUR[1], _conv_state._UBATCH[0])
++    _CUR[0], _CUR[1] = ub, tuple(bounds)
++    _conv_state._UBATCH[0] = ub
++    try:
++        yield
++    finally:
++        _CUR[0], _CUR[1], _conv_state._UBATCH[0] = prev
++
++
++def step_attn_metadata():
++    """The step's metadata for the current part (None for a part holding only
++    padding: attention and convs then skip KV and state writes)."""
++    ctx = get_forward_context()
++    md = ctx.attn_metadata
++    ub, bounds = _CUR
++    if ub == 0 or not isinstance(md, dict):
++        return md
++    cache = getattr(ctx, "_ink2_ub_split", None)
++    if cache is None or cache[0] is not md or cache[1] != bounds:
++        cache = (md, bounds, split_parts(md, bounds))
++        ctx._ink2_ub_split = cache
++    return cache[2][ub - 1]
++
++
++def _num_actual(md_dict) -> int:
++    from .attention import Inkling2AttentionMetadata
++
++    for md in md_dict.values():
++        if isinstance(md, Inkling2AttentionMetadata):
++            return int(md.num_actual_tokens)
++    raise ValueError("Inkling2 microbatch split needs attention metadata")
++
++
++def split_parts(md_dict, bounds: tuple) -> list:
++    """Split at the given token boundaries into len(bounds) + 1 parts by chained
++    two-way splits; parts past the last real token are None."""
++    parts, rest, start = [], md_dict, 0
++    for b in bounds:
++        if rest is None:
++            parts.append(None)
++            continue
++        h = b - start
++        if h >= _num_actual(rest):
++            parts.append(rest)
++            rest = None
++        else:
++            a, rest = split_metadata(rest, h)
++            parts.append(a)
++        start = b
++    parts.append(rest)
++    return parts
++
++
++def _plan(md_dict, h: int):
++    from .attention import Inkling2AttentionMetadata
++
++    for md in md_dict.values():
++        if isinstance(md, Inkling2AttentionMetadata):
++            lens = np.asarray(md.query_lens_cpu, dtype=np.int64)
++            cu = np.zeros(len(lens) + 1, dtype=np.int64)
++            np.cumsum(lens, out=cu[1:])
++            n_actual = int(md.num_actual_tokens)
++            assert 0 < h < n_actual, (h, n_actual)
++            k_a = int(np.searchsorted(cu, h, side="left"))       # requests starting before h
++            j_b = int(np.searchsorted(cu, h, side="right")) - 1  # request holding token h
++            return cu, k_a, j_b, n_actual
++    raise ValueError("Inkling2 microbatch split needs attention metadata")
++
++
++def split_metadata(md_dict, h: int):
++    from vllm.v1.attention.backends.mamba_attn import BaseMambaAttentionMetadata
++
++    from .attention import Inkling2AttentionMetadata
++
++    cu, k_a, j_b, n_actual = _plan(md_dict, h)
++    memo, out_a, out_b = {}, {}, {}
++    for name, md in md_dict.items():
++        pair = memo.get(id(md))
++        if pair is None:
++            if isinstance(md, Inkling2AttentionMetadata):
++                pair = _split_attention(md, h, cu, k_a, j_b, n_actual)
++            elif isinstance(md, BaseMambaAttentionMetadata):
++                pair = _split_mamba(md, h, k_a, j_b, n_actual)
++            else:
++                # Other layers (the DSpark draft) do not run inside the target forward.
++                pair = (md, md)
++            memo[id(md)] = pair
++        out_a[name], out_b[name] = pair
++    return out_a, out_b
++
++
++def _split_attention(md, h, cu, k_a, j_b, n_actual):
++    nd = int(getattr(md, "num_decode_reqs", 0) or 0)
++    ndt = int(getattr(md, "num_decode_tokens", 0) or 0)
++    qsl = md.query_start_loc
++    seq_cpu = np.asarray(md.seq_lens_cpu, dtype=np.int64)
++    lens_a = np.minimum(cu[1 : k_a + 1], h) - cu[:k_a]
++    seq_a = seq_cpu[:k_a] - np.maximum(cu[1 : k_a + 1] - h, 0)
++    lens_b = cu[j_b + 1 :] - np.maximum(cu[j_b:-1], h)
++    seq_b = seq_cpu[j_b:]
++    a = dataclasses.replace(
++        md,
++        query_start_loc=torch.clamp(qsl[: k_a + 1], max=h),
++        seq_lens=md.seq_lens[:k_a] - torch.clamp(qsl[1 : k_a + 1] - h, min=0),
++        block_table=md.block_table[:k_a],
++        slot_mapping=md.slot_mapping[:h],
++        num_actual_tokens=h,
++        max_query_len=int(lens_a.max()),
++        max_seq_len=int(seq_a.max()),
++        query_lens_cpu=lens_a,
++        seq_lens_cpu=seq_a,
++    )
++    b = dataclasses.replace(
++        md,
++        query_start_loc=torch.clamp(qsl[j_b:] - h, min=0),
++        seq_lens=md.seq_lens[j_b:],
++        block_table=md.block_table[j_b:],
++        slot_mapping=md.slot_mapping[h:],
++        num_actual_tokens=n_actual - h,
++        max_query_len=int(lens_b.max()),
++        max_seq_len=int(seq_b.max()),
++        query_lens_cpu=lens_b,
++        seq_lens_cpu=seq_b,
++    )
++    a.num_decode_reqs, a.num_decode_tokens = nd, ndt
++    a.num_prefill_reqs, a.num_prefill_tokens = k_a - nd, h - ndt
++    b.num_decode_reqs, b.num_decode_tokens = 0, 0
++    b.num_prefill_reqs, b.num_prefill_tokens = len(lens_b), n_actual - h
++    return a, b
++
++
++def _split_mamba_spec(md, h, k_a, j_b, n_actual):
++    """PLE short-conv metadata with spec-decode (verify) rows. The batch is
++    verify rows, then plain decodes, then prefills; verify and decode rows all
++    land in part A (h > their tokens), part B holds prefills only."""
++    nsd, nst = md.num_spec_decodes, md.num_spec_decode_tokens
++    nd, ndt = md.num_decodes, md.num_decode_tokens
++    assert h > nst + ndt, (h, nst, ndt)
++    pre = nst + ndt  # first prefill token
++    qp = md.query_start_loc_p
++    sp = md.state_indices_tensor_p
++    npf_a = k_a - nd - nsd
++    first_b = j_b - nd - nsd
++    si = md.state_indices_tensor
++    a = dataclasses.replace(
++        md,
++        num_prefills=npf_a,
++        num_prefill_tokens=h - pre,
++        query_start_loc=torch.clamp(md.query_start_loc[: k_a + 1], max=h),
++        query_start_loc_p=None if qp is None else torch.clamp(qp[: npf_a + 1], max=h - pre),
++        state_indices_tensor_p=None if sp is None else sp[:npf_a],
++        state_indices_tensor=None if si is None else si[: nd + npf_a],
++    )
++    b = dataclasses.replace(
++        md,
++        num_spec_decodes=0,
++        num_spec_decode_tokens=0,
++        num_decodes=0,
++        num_decode_tokens=0,
++        query_start_loc_d=None,
++        state_indices_tensor_d=None,
++        num_prefills=md.num_prefills - first_b,
++        num_prefill_tokens=n_actual - h,
++        query_start_loc_p=torch.clamp(qp[first_b:] - (h - pre), min=0),
++        state_indices_tensor_p=None if sp is None else sp[first_b:],
++    )
++    return a, b
++
++
++def _split_mamba(md, h, k_a, j_b, n_actual):
++    if int(getattr(md, "num_spec_decodes", 0) or 0):
++        return _split_mamba_spec(md, h, k_a, j_b, n_actual)
++    nd, ndt = md.num_decodes, md.num_decode_tokens
++    qp = md.query_start_loc_p
++    sp = md.state_indices_tensor_p
++    npf_a = k_a - nd
++    first_b = j_b - nd  # index of B's first request among the prefills
++    a = dataclasses.replace(
++        md,
++        num_prefills=npf_a,
++        num_prefill_tokens=h - ndt,
++        query_start_loc_p=torch.clamp(qp[: npf_a + 1], max=h - ndt),
++        state_indices_tensor_p=None if sp is None else sp[:npf_a],
++    )
++    b = dataclasses.replace(
++        md,
++        num_decodes=0,
++        num_decode_tokens=0,
++        query_start_loc_d=None,
++        state_indices_tensor_d=None,
++        num_prefills=md.num_prefills - first_b,
++        num_prefill_tokens=n_actual - h,
++        query_start_loc_p=torch.clamp(qp[first_b:] - (h - ndt), min=0),
++        state_indices_tensor_p=None if sp is None else sp[first_b:],
++    )
++    return a, b

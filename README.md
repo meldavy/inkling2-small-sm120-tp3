@@ -1,20 +1,38 @@
 # Inkling-2-Small on 3× RTX PRO 6000 (sm120) at TP3
 
-Patches and a launch script for serving [mel-bw/Inkling-2-Small-EXL3-3.17bpw](https://huggingface.co/mel-bw/Inkling-2-Small-EXL3-3.17bpw) with vLLM on three 96 GB Blackwell workstation cards. Preliminary: work in progress.
+Patches and a launch script for serving [mel-bw/Inkling-2-Small-EXL3-3.17bpw](https://huggingface.co/mel-bw/Inkling-2-Small-EXL3-3.17bpw) with vLLM on three 96 GB Blackwell workstation cards. Text and image input are supported.
 
-| | |
-|---|---|
-| Prefill | ~5,400 tok/s at 8k prompts, ~5,000 at 32k |
-| Decode | ~88–93 tok/s, one stream, no speculative decoding yet |
-| Context | 1,000,000 tokens, BF16 KV cache, prefix caching on |
+Tested on 3× RTX PRO 6000 Blackwell Max-Q (250 W, PCIe Gen4 x16, no P2P), Ampere Altra (aarch64, 2.2 GHz), CUDA 13.0, Python 3.12.
 
-Tested on 3× RTX PRO 6000 Blackwell Max-Q (250 W, PCIe Gen4 x16, no P2P), Ampere Altra (aarch64), CUDA 13.0, Python 3.12.
+## Performance (no speculative decoding; see [DSpark](#dspark-speculative-decoding-work-in-progress))
+
+Single stream, prefix caching on.
+
+| | BF16 KV | FP8 KV | BF16 KV + optional patches | FP8 KV + optional patches |
+|---|---|---|---|---|
+| Prefill, 8k-token prompt | 4,412 tok/s | 4,463 tok/s | 5,403 tok/s | 5,445 tok/s |
+| Prefill, 32k-token prompt | 4,400 tok/s | 4,460 tok/s | 5,365 tok/s | 5,498 tok/s |
+| Decode | 86.1 tok/s | 85.3 tok/s | 104.8 tok/s | 105.3 tok/s |
+| KV cache capacity | 936,461 tokens | 1,885,836 tokens | 858,852 tokens | 1,729,548 tokens |
+| Context window | 850,000 tokens | 1,000,000 tokens | 850,000 tokens | 1,000,000 tokens |
+
+"Optional patches" is `patches/vllm/optional/0004` and `0005` plus prefill CUDA graphs (`GRAPHS=1`). Prefill is measured on unique random-token prompts (no prefix-cache hits); decode is the mean over four chat prompts, 512 tokens each. KV capacity is what vLLM allocates at `--gpu-memory-utilization 0.98`.
+
+The optional patches target this test system: GPUs without P2P and a slow aarch64 host CPU. On systems with P2P, or with a faster x86 host CPU, the gains from the optional patches may be smaller.
+
+Quality, from the Local Inference Lab [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) profiles, 10 concurrent requests against `--max-num-seqs 4`. Scores are correct answers out of completed runs.
+
+| | BF16 KV + optional patches | BF16 KV + optional patches + DSpark | FP8 KV + optional patches + DSpark |
+|---|---|---|---|
+| Estonia | 29/30 | 28/30 | 29/30 |
+| LAVD | 30/30 | 30/30 | not run yet |
+| Hotel lights | 24/24 | 21/21 | not run yet |
 
 ## Base versions
 
 | Component | Base | Patches |
 |---|---|---|
-| vLLM | [vllm-project/vllm](https://github.com/vllm-project/vllm) `efe12305f064b9c5301231d66eb42b7c0db5895f` | `patches/vllm/0001`–`0003`, in order |
+| vLLM | [vllm-project/vllm](https://github.com/vllm-project/vllm) `efe12305f064b9c5301231d66eb42b7c0db5895f` | `patches/vllm/0001`–`0003`, in order; optionally `patches/vllm/optional/0004`–`0005` |
 | ExLlamaV3 | [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) `a3bfbfd0d3c0cea67815146a19fcd2bb3f84709a` | `patches/exllamav3/` |
 | Decode-once MoE kernel | `xmoe_do` from [diffbot's recipe](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000), plus [`do_gemm.diff`](https://github.com/meldavy/dsv41f-1017-sm120-tp3/blob/main/patches/kernel/do_gemm.diff) | `patches/kernel/` |
 | FlashInfer | `flashinfer-python==0.7.3` from PyPI | none |
@@ -22,24 +40,118 @@ Tested on 3× RTX PRO 6000 Blackwell Max-Q (250 W, PCIe Gen4 x16, no P2P), Amper
 
 ## Patches
 
+Required to run the model.
+
 **vLLM**
 
 | Patch | What it does |
 |---|---|
 | `0001-pr67325-inkling2-small.diff` | Inkling 2 Small model support, [#67325](https://github.com/vllm-project/vllm/pull/67325) as of `d664cd1e`. |
 | `0002-pr55078-pr51560-inkling-triton-fallback.diff` | Triton attention fallback for Inkling on SM8x ([#55078](https://github.com/vllm-project/vllm/pull/55078)) and SM12x ([#51560](https://github.com/vllm-project/vllm/pull/51560)), merged on top of 0001. |
-| `0003-inkling2-sm120-exl3-tp3.diff` | Everything below. |
+| `0003-inkling2-sm120-tp3.diff` | SM120 kernels, EXL3 experts, TP3, fixed-size conv state, FP8 KV cache, vision and DSpark on SM120. Details below. |
 
 What 0003 changes:
 
-- **SM120 relative attention.** Inkling 2's relative-position attention ships as an FA4 kernel that only runs on SM100. `ops/triton_rel_attention_sm12x.py` is a paged Triton version with split-KV decode, selected in `ops/attention.py` on SM12x.
-- **Shared-memory limits.** SM120 has about 100 KB of shared memory per block, against about 228 KB on SM100. `ops/linear.py` caps tile sizes and pipeline stages, disables TMA, and falls back to torch where the CuTe-DSL GEMM is unsupported.
-- **Fixed-size conv state.** The PR keeps the short-convolution history per token in the paged cache: 24 KiB per token per layer, which caps context near 65k on this setup. `conv_state.py` replaces it with a fixed per-request state (the last W−1 rows), like vLLM's Mamba models. That makes room for 1M tokens, and prefix caching works through vLLM's `--mamba-cache-mode align`. Wiring is in `sconv.py`, `ops/sconv.py`, `attention.py` and `model.py`.
-- **EXL3 experts.** `exl3_moe.py` loads EXL3 routed experts, sliced for tensor parallelism, and runs them on ExLlamaV3 kernels: the cooperative kernel for decode and the decode-once grouped GEMM for prefill. Enabled with `INKLING2_EXL3=1`.
-- **All-reduce without P2P.** These GPUs have no peer access, and NCCL's host path tops out near 9.4 GB/s. `ops/host_allreduce.py` reduces decode-size tensors through host-mapped memory. `ops/dma_allreduce.py` reduces prefill tensors of 4 MB or more with a copy-engine reduce-scatter and all-gather through pinned host memory.
-- **TP3 at load time.** Eight KV heads don't split three ways. `tp_pad.py`, called from a config hook in `model_executor/models/config.py`, pads attention from 48 query / 8 KV heads to 54 / 9 at load time. The added heads are inert, so outputs are unchanged. The model and DSpark loaders in `model.py` and `dspark.py` pad the tensors as they load.
+- **SM120 relative attention.** The PR's relative attention is a `tml_fa4` kernel that runs only on SM100, and 0002's Triton kernels (#51560, #55078) are for Inkling 1, which lays out its relative logits differently. `ops/triton_rel_attention_sm12x.py` follows their design (paged Triton, split-KV decode), reads Inkling 2's sheared relative logits, and returns the fp32 output and LSE that `gate_sink` expects. Selected in `ops/attention.py` on SM12x.
+- **SM120 shared memory.** SM120 allows 99 KB of shared memory per block against 227 KB on SM100, so the PR's GEMM configs don't fit. `ops/linear.py` caps tiles and pipeline stages, disables TMA, and falls back to torch where CuTe-DSL is unsupported.
+- **Fixed-size conv state.** The PR keeps the short-conv history per token in the paged KV cache (24 KiB per token per layer), which caps context near 65k on this setup. `conv_state.py` keeps a fixed per-request state on vLLM's Mamba state path (`MambaBase` and the ShortConv backend), so prefix caching works through `--mamba-cache-mode align`. Wired through `sconv.py`, `ops/sconv.py`, `attention.py` and `model.py`.
+- **EXL3 experts.** The NVFP4 experts don't fit in 3× 96 GB alongside a 1M-token context. `exl3_moe.py` runs EXL3 experts, sliced for TP, on turboderp's ExLlamaV3 cooperative MoE kernel for decode and diffbot's decode-once grouped GEMM for prefill, the same pairing as the [DS4.1 recipe](https://github.com/meldavy/dsv41f-1017-sm120-tp3). Enabled with `INKLING2_EXL3=1`.
+- **TP3 head padding.** 8 KV heads don't divide by 3. This follows the local-inference-lab KK fork's TP3 padding for DeepSeek V4.1, done at load time: `tp_pad.py`, called from a config hook in `model_executor/models/config.py`, pads 48 query / 8 KV heads to 54 / 9 with zero-padded heads for the target and DSpark models. Outputs are unchanged.
+- **FP8 KV cache.** vLLM's `--kv-cache-dtype fp8` (e4m3), implemented in the SM120 attention kernels. See [KV cache: BF16 and FP8](#kv-cache-bf16-and-fp8).
+- **Vision on SM120.** The encoder's `tml_fa4` attention runs only on SM100. Elsewhere it uses vLLM's `MMEncoderAttention` (`vision.py`).
+- **DSpark on SM120.** The draft model's block attention is a Gluon kernel that runs only on SM100. `ops/block_attn_sm12x.py` is a split-KV Triton replacement. The cross-rank argmax uses FlashInfer's NVLink multicast when available and an all-gather of per-rank maxima otherwise (`dspark.py`). The conv state follows vLLM's speculative short-conv layout. See [DSpark](#dspark-speculative-decoding-work-in-progress).
 
-**ExLlamaV3 and the decode-once kernel.** Both patches add Inkling 2's soft-capped SwiGLU, `4·tanh(g/4)·sigmoid(g) · 25·tanh(u/25)`, as activation id 5. In ExLlamaV3 that's the cooperative MoE kernel and `hadamard_inner.cuh`; in the decode-once kernel it's `xmoe/quant/hadamard_inner.cuh`.
+**ExLlamaV3 and the decode-once kernel.** Both patches add Inkling 2's soft-capped SwiGLU, `4·tanh(g/4)·sigmoid(g) · 25·tanh(u/25)`, as activation id 5. In ExLlamaV3 that is the cooperative MoE kernel and `hadamard_inner.cuh`; in the decode-once kernel it is `xmoe/quant/hadamard_inner.cuh`.
+
+## Optional patches
+
+Two patches in `patches/vllm/optional/`, applied in order on top of 0003. Outputs are unchanged.
+
+Each patch's effect, BF16 KV cache, single stream (same method as the performance table):
+
+| | 0003 | + 0004 | + 0004 + 0005 |
+|---|---|---|---|
+| Prefill, 8k-token prompt | 4,412 tok/s | 4,312 tok/s | 5,403 tok/s |
+| Prefill, 32k-token prompt | 4,400 tok/s | 4,371 tok/s | 5,365 tok/s |
+| Decode | 86.1 tok/s | 98.0 tok/s | 104.8 tok/s |
+
+The "+ 0004" and "+ 0004 + 0005" columns use prefill CUDA graphs (`GRAPHS=1`).
+
+**`0004-sm120-low-batch-kernels.diff`**: decode kernels for SM120, independent of the GPU interconnect.
+
+| Change | Files | What it addresses |
+|---|---|---|
+| Low-M GEMV | `ops/gemv_sm12x.py`, `ops/linear.py` | The PR sends M ≤ 16 GEMMs to FlashInfer's CuTe-DSL low-M kernels, which don't run on SM120, and its cuBLAS fallback runs well below memory bandwidth. A Triton split-K GEMV handles up to 16 rows, including the router. |
+| Fused routing | `exl3_moe.py` | The PR's router (sigmoid, bias, top-8, gather, normalize) runs as separate torch ops. A single Triton kernel computes the same math for decode-size batches. |
+| Cooperative-kernel rows | `exl3_moe.py` | `INKLING2_COOP_MAX_ROWS` (default 8) sets how many rows run on ExLlamaV3's cooperative MoE kernel. `serve.sh` sets 32 with DSpark, so verify batches of up to 4 requests stay on it. |
+
+**`0005-no-p2p-allreduce-overlap.diff`**: tensor-parallel communication for GPUs without P2P. At startup it checks CUDA peer access between the TP ranks; with peer access, both custom all-reduces stay off and all reductions use vLLM's all-reduce. `INKLING2_HOST_AR=1` and `INKLING2_DMA_AR=1` force them on, `=0` forces them off.
+
+| Change | Files | What it addresses |
+|---|---|---|
+| Host-mapped all-reduce | `ops/host_allreduce.py` | vLLM's custom all-reduce and FlashInfer's Lamport all-reduce need P2P, and vLLM's doesn't support TP3. Without P2P, NCCL uses its SHM transport at about 18 µs per small call. Decode-size tensors (up to 64 KB) instead use a one-shot all-reduce in host-mapped memory with NCCL's LL protocol (4-byte data + 4-byte flag per 8-byte word), at about 6 µs per call. |
+| Copy-engine all-reduce | `ops/dma_allreduce.py` | NCCL's SHM transport tops out near 9.4 GB/s here. Prefill tensors of 4 MB or more use a reduce-scatter + all-gather through pinned host memory on the copy engines, synchronized with stream memory operations (`cuStreamWriteValue64` / `cuStreamWaitValue64`), near the PCIe limit. CUDA-graph safe. |
+| Two-microbatch prefill overlap | `ubatch.py`, `model.py`, `attention.py`, `sconv.py`, `conv_state.py` | Same idea as DeepSeek's two-batch overlap and vLLM's dual-batch overlap (DBO), but vLLM's DBO overlaps expert-parallel all-to-all, not TP all-reduce. Prefill runs as two microbatches staggered per layer, so each one's all-reduce overlaps the other's compute. |
+
+**Prefill CUDA graphs** are a launch option (`GRAPHS=1`): prefill is captured at 256 to 4096 tokens to remove host launch overhead. With 0005, the overlap's all-reduce launch and wait run as eager breaks through vLLM's breakable CUDA graphs.
+
+## KV cache: BF16 and FP8
+
+`KV_DTYPE=auto` (BF16) or `KV_DTYPE=fp8` in `serve.sh`.
+
+With FP8, K and V are stored as e4m3 with a scale of 1.0. Values are cast in registers when the attention prologue writes them, clamped to ±448, and converted back to BF16 in registers after each load in the attention kernels; there is no separate conversion pass. Inkling's V is RMS-normalized and K is norm-clipped before the cache write, so both sit well inside the e4m3 range. The DSpark draft layers use the same cache dtype.
+
+| | BF16 | FP8 |
+|---|---|---|
+| KV cache capacity (optional patches) | 858,852 tokens | 1,729,548 tokens |
+| Negative log-likelihood, 8k-token real text | 1.0359 | 1.0362 |
+| Top-1 token agreement with BF16 | — | 98.0% |
+| Decode | 104.8 tok/s | 105.3 tok/s |
+| Prefill, 32k-token prompt | 5,365 tok/s | 5,498 tok/s |
+
+## DSpark speculative decoding (work in progress)
+
+`SPEC=1` in `serve.sh` enables the checkpoint's DSpark draft model (`mtp.safetensors`, 7 draft tokens per step). Output quality matches decoding without it: token log-probabilities along DSpark-decoded text agree with a plain prefill over the same tokens to within the same margin as plain decoding (mean |Δ log p| 0.006–0.013).
+
+Single stream, 512 tokens per prompt, optional patches applied:
+
+| Prompt | Decode, BF16 KV | Decode, FP8 KV | Accepted tokens per step (BF16 / FP8) |
+|---|---|---|---|
+| Python LRU cache | 101.6 tok/s | 110.0 tok/s | 2.53 / 2.73 |
+| History of Tallinn | 75.1 tok/s | 73.8 tok/s | 1.83 / 1.78 |
+| Train word problem | 127.5 tok/s | 156.2 tok/s | 3.19 / 3.91 |
+| 40 words starting with "st" | 152.0 tok/s | 135.2 tok/s | 3.62 / 3.25 |
+| Without DSpark | 104.8 tok/s | 105.3 tok/s | — |
+
+Decode with the same four prompts run one at a time (c=1) and all at once (c=4):
+
+| | BF16 KV | BF16 KV + DSpark | FP8 KV | FP8 KV + DSpark |
+|---|---|---|---|---|
+| c=1, per request | 104.8 tok/s | 114.0 tok/s | 105.3 tok/s | 118.8 tok/s |
+| c=4, per request | 57.1 tok/s | 50.0 tok/s | 58.3 tok/s | 52.3 tok/s |
+| c=4, total | 220.6 tok/s | 153.9 tok/s | 225.4 tok/s | 159.1 tok/s |
+
+Capacity and prefill:
+
+| | BF16 KV | BF16 KV + DSpark | FP8 KV | FP8 KV + DSpark |
+|---|---|---|---|---|
+| KV cache capacity | 858,852 tokens | 502,789 tokens | 1,729,548 tokens | 1,016,375 tokens |
+| Prefill, 32k-token prompt | 5,365 tok/s | 5,114 tok/s | 5,498 tok/s | 4,949 tok/s |
+
+Draft acceptance by position, over the Estonia and LAVD reasoning benchmarks (161k verify steps, 3.82 accepted tokens per step):
+
+| Draft position | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|
+| Accepted | 64% | 50% | 42% | 37% | 33% | 29% | 27% |
+
+Status:
+
+- A verify step checks 8 tokens. Each token routes to 8 of 384 experts, so a step reads about 12 GB of expert weights per GPU against about 1.6 GB for a single-token decode step, and takes about 25 ms against 9.4 ms. DSpark is faster when more than about 2.6 tokens are accepted per step: reasoning, code and structured output gain, plain prose is slower.
+- With several concurrent requests, verify batches grow to 8 tokens per request and read a large share of all experts, so at c=4 DSpark lowers both per-request and total throughput (table above).
+- The draft model's weights, its full-attention layer and its CUDA graphs reduce KV cache capacity.
+- The draft model's own forward pass takes 6–8 ms per step, well above what reading its weights requires.
+- vLLM's adaptive verification (`enable_adaptive_verification`) runs and produces correct output with these patches, but on this host its per-step bookkeeping costs more than it saves, so `serve.sh` leaves it off.
+- The checkpoint's draft block is 8 positions, so DSpark always proposes 7 draft tokens.
 
 ## Build
 
@@ -53,6 +165,7 @@ export CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH TORCH_
 git clone https://github.com/vllm-project/vllm $SRC/vllm && cd $SRC/vllm
 git checkout efe12305f064b9c5301231d66eb42b7c0db5895f
 for p in $REPO/patches/vllm/*.diff; do git apply "$p"; done
+for p in $REPO/patches/vllm/optional/*.diff; do git apply "$p"; done   # optional, 0004 then 0005
 pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu130
 CMAKE_CUDA_ARCHITECTURES=120a NVCC_THREADS=4 MAX_JOBS=48 pip install --no-build-isolation -e .
 
@@ -77,15 +190,22 @@ hf download mel-bw/Inkling-2-Small-EXL3-3.17bpw --local-dir /path/to/Inkling-2-S
 MODEL=/path/to/Inkling-2-Small-EXL3-3.17bpw SRC=$SRC $REPO/scripts/serve.sh
 ```
 
-[`scripts/serve.sh`](scripts/serve.sh) serves an OpenAI-compatible API on port 8300 as `Inkling-2-Small`, with reasoning and tool-call parsing. Startup takes about 7 minutes. Set `PROFILE=context` for the full 1,048,576-token window, at about 6% slower prefill.
+[`scripts/serve.sh`](scripts/serve.sh) serves an OpenAI-compatible API on port 8300 as `Inkling-2-Small`, with reasoning and tool-call parsing and up to 4 images per prompt. Startup takes about 5 minutes.
+
+| Variable | Values |
+|---|---|
+| `KV_DTYPE` | `auto` (BF16, default) or `fp8` |
+| `GRAPHS` | `1` (default): prefill CUDA graphs and the two-part prefill overlap, requires the optional patch. `0`: eager prefill. |
+| `SPEC` | `1`: DSpark speculative decoding |
+| `IMAGES` | images per prompt, default 4; `0` for text only |
+| `PROFILE` | `fast` (default): 4k prefill chunks, 1,000,000-token context. `context`: 2k chunks, 1,048,576 tokens. |
+| `MAXLEN` | context window; lower it to fit the KV capacity of the chosen configuration |
 
 ## Known limitations
 
-- No speculative decoding yet: the DSpark drafter loads, but the conv state has no rollback.
 - Prefix-cache hits land only where an earlier prompt ended, so multi-turn chat hits but unrelated prompts sharing a system prompt don't. This is how align mode works for every Mamba-style model.
 - The first prefix-cache hit after startup pays a one-time ~3 s kernel compile.
-- Text only: image inputs are disabled.
 
 ## Credits
 
-[Thinking Machines](https://huggingface.co/thinkingmachines) (Inkling 2 Small); vLLM authors of [#67325](https://github.com/vllm-project/vllm/pull/67325) (WoosukKwon), [#51560](https://github.com/vllm-project/vllm/pull/51560) (m4xkushnir) and [#55078](https://github.com/vllm-project/vllm/pull/55078) (TheVerdman); turboderp (ExLlamaV3); diffbot (decode-once kernel). Work is tracked in the Local Inference Lab Discord.
+[Thinking Machines](https://huggingface.co/thinkingmachines) (Inkling 2 Small); vLLM authors of [#67325](https://github.com/vllm-project/vllm/pull/67325) (WoosukKwon), [#51560](https://github.com/vllm-project/vllm/pull/51560) (m4xkushnir) and [#55078](https://github.com/vllm-project/vllm/pull/55078) (TheVerdman); turboderp (ExLlamaV3); diffbot (decode-once kernel); local-inference-lab (KK vLLM fork, TP3 head padding). Work is tracked in the Local Inference Lab Discord.
