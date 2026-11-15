@@ -5,6 +5,7 @@
 #        GRAPHS=1          prefill CUDA graphs + two-part prefill overlap (needs the optional patch)
 #                          0: eager prefill (patches only)
 #        SPEC=1            DSpark speculative decoding (work in progress)
+#        SPEC_K=3          DSpark drafts verified per step (1-7)
 #        IMAGES=4          max images per prompt (0: text only)
 #        PROFILE=fast      4k prefill chunks, 1,000,000-token default context (default)
 #                context   2k prefill chunks, 1,048,576-token default context
@@ -38,7 +39,7 @@ SP=()
 if [ "${SPEC:-0}" = "1" ]; then
   # Verify batches of up to 4 requests x 8 tokens stay on the cooperative MoE kernel
   export INKLING2_COOP_MAX_ROWS=${INKLING2_COOP_MAX_ROWS:-32}
-  SP=(--speculative-config '{"method": "dspark", "num_speculative_tokens": 7}')
+  SP=(--speculative-config "{\"method\": \"dspark\", \"num_speculative_tokens\": ${SPEC_K:-3}}")
 fi
 
 exec vllm serve "$MODEL" --tensor-parallel-size 3 --host 0.0.0.0 --port "${PORT:-8300}" \

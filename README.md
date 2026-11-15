@@ -22,7 +22,7 @@ The optional patches target this test system: GPUs without P2P and a slow aarch6
 
 Quality, from the Local Inference Lab [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) profiles, 10 concurrent requests against `--max-num-seqs 4`. Scores are correct answers out of completed runs.
 
-| | BF16 KV + optional patches | BF16 KV + optional patches + DSpark | FP8 KV + optional patches + DSpark |
+| | BF16 KV + optional patches | BF16 KV + optional patches + DSpark (`SPEC_K=7`) | FP8 KV + optional patches + DSpark (`SPEC_K=7`) |
 |---|---|---|---|
 | Estonia | 29/30 | 28/30 | 29/30 |
 | LAVD | 30/30 | 30/30 | not run yet |
@@ -111,34 +111,41 @@ With FP8, K and V are stored as e4m3 with a scale of 1.0. Values are cast in reg
 
 ## DSpark speculative decoding (work in progress)
 
-`SPEC=1` in `serve.sh` enables the checkpoint's DSpark draft model (`mtp.safetensors`, 7 draft tokens per step). Output quality matches decoding without it: token log-probabilities along DSpark-decoded text agree with a plain prefill over the same tokens to within the same margin as plain decoding (mean |Δ log p| 0.006–0.013).
+`SPEC=1` in `serve.sh` enables the checkpoint's DSpark draft model (`mtp.safetensors`). The draft model always fills its trained 8-position block (the accepted token plus 7 masked positions); `SPEC_K` (1–7, default 3) sets how many of its drafts the main model verifies per step. Output quality matches decoding without DSpark: token log-probabilities along DSpark-decoded text agree with a plain prefill over the same tokens to within the same margin as plain decoding.
 
-Single stream, 512 tokens per prompt, optional patches applied:
+**`SPEC_K=3` is the recommended starting value.** Raise it when your drafts are accepted more often (code, structured output) or when a verify step is cheap relative to a decode step on your hardware (faster GPUs, P2P interconnect), and measure with your own workload. On this system, single stream, BF16 KV, optional patches (one sweep; separate sessions vary by about ±5%):
+
+| `SPEC_K` | 7 | 4 | 3 | Without DSpark |
+|---|---|---|---|---|
+| Decode, mean of four prompts | 117.6 tok/s | 130.3 tok/s | 130.8 tok/s | 104.8 tok/s |
+| Decode, prose prompt | 74.3 tok/s | 83.6 tok/s | 95.8 tok/s | 105.0 tok/s |
+
+All further numbers in this section use `SPEC_K=3` and the optional patches. Single stream, 512 tokens per prompt:
 
 | Prompt | Decode, BF16 KV | Decode, FP8 KV | Accepted tokens per step (BF16 / FP8) |
 |---|---|---|---|
-| Python LRU cache | 101.6 tok/s | 110.0 tok/s | 2.53 / 2.73 |
-| History of Tallinn | 75.1 tok/s | 73.8 tok/s | 1.83 / 1.78 |
-| Train word problem | 127.5 tok/s | 156.2 tok/s | 3.19 / 3.91 |
-| 40 words starting with "st" | 152.0 tok/s | 135.2 tok/s | 3.62 / 3.25 |
+| Python LRU cache | 132.5 tok/s | 130.4 tok/s | 2.32 / 2.34 |
+| History of Tallinn | 98.5 tok/s | 95.5 tok/s | 1.72 / 1.70 |
+| Train word problem | 165.1 tok/s | 154.5 tok/s | 2.91 / 2.78 |
+| 40 words starting with "st" | 159.2 tok/s | 167.4 tok/s | 2.85 / 3.04 |
 | Without DSpark | 104.8 tok/s | 105.3 tok/s | — |
 
-Decode with the same four prompts run one at a time (c=1) and all at once (c=4):
+Concurrency: c=1 runs the four prompts one at a time. c=4 keeps four requests in flight for 90 s (each finished request is immediately replaced, prompts mixed), measured three times; ranges in parentheses.
 
 | | BF16 KV | BF16 KV + DSpark | FP8 KV | FP8 KV + DSpark |
 |---|---|---|---|---|
-| c=1, per request | 104.8 tok/s | 114.0 tok/s | 105.3 tok/s | 118.8 tok/s |
-| c=4, per request | 57.1 tok/s | 50.0 tok/s | 58.3 tok/s | 52.3 tok/s |
-| c=4, total | 220.6 tok/s | 153.9 tok/s | 225.4 tok/s | 159.1 tok/s |
+| c=1, per request | 104.8 tok/s | 138.8 tok/s | 105.3 tok/s | 137.0 tok/s |
+| c=4, per request | 55.0 tok/s (54.5–55.4) | 56.0 tok/s (55.5–56.3) | 55.4 tok/s (55.2–55.5) | 55.2 tok/s (54.3–55.7) |
+| c=4, total | 213.4 tok/s (211.7–214.8) | 208.7 tok/s (206.9–210.3) | 214.6 tok/s (214.0–215.1) | 206.1 tok/s (203.6–207.9) |
 
 Capacity and prefill:
 
 | | BF16 KV | BF16 KV + DSpark | FP8 KV | FP8 KV + DSpark |
 |---|---|---|---|---|
-| KV cache capacity | 858,852 tokens | 502,789 tokens | 1,729,548 tokens | 1,016,375 tokens |
-| Prefill, 32k-token prompt | 5,365 tok/s | 5,114 tok/s | 5,498 tok/s | 4,949 tok/s |
+| KV cache capacity | 858,852 tokens | 512,599 tokens | 1,729,548 tokens | 1,051,158 tokens |
+| Prefill, 32k-token prompt | 5,365 tok/s | 5,540 tok/s | 5,498 tok/s | 5,235 tok/s |
 
-Draft acceptance by position, over the Estonia and LAVD reasoning benchmarks (161k verify steps, 3.82 accepted tokens per step):
+Draft acceptance by position, over the Estonia and LAVD reasoning benchmarks (161k verify steps):
 
 | Draft position | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
 |---|---|---|---|---|---|---|---|
@@ -146,12 +153,11 @@ Draft acceptance by position, over the Estonia and LAVD reasoning benchmarks (16
 
 Status:
 
-- A verify step checks 8 tokens. Each token routes to 8 of 384 experts, so a step reads about 12 GB of expert weights per GPU against about 1.6 GB for a single-token decode step, and takes about 25 ms against 9.4 ms. DSpark is faster when more than about 2.6 tokens are accepted per step: reasoning, code and structured output gain, plain prose is slower.
-- With several concurrent requests, verify batches grow to 8 tokens per request and read a large share of all experts, so at c=4 DSpark lowers both per-request and total throughput (table above).
+- A verify step checks `SPEC_K` + 1 tokens, and each token routes to 8 of 384 experts, so the expert weights a step reads grow almost linearly with `SPEC_K`. The cost of a verify step against a single-token decode step sets how many accepted tokens per step DSpark needs to be faster.
+- Under sustained 4-request load, DSpark matches decoding without it per request and delivers 2–4% less total throughput (table above): its gain is in single-stream decode.
 - The draft model's weights, its full-attention layer and its CUDA graphs reduce KV cache capacity.
 - The draft model's own forward pass takes 6–8 ms per step, well above what reading its weights requires.
 - vLLM's adaptive verification (`enable_adaptive_verification`) runs and produces correct output with these patches, but on this host its per-step bookkeeping costs more than it saves, so `serve.sh` leaves it off.
-- The checkpoint's draft block is 8 positions, so DSpark always proposes 7 draft tokens.
 
 ## Build
 
@@ -197,6 +203,7 @@ MODEL=/path/to/Inkling-2-Small-EXL3-3.17bpw SRC=$SRC $REPO/scripts/serve.sh
 | `KV_DTYPE` | `auto` (BF16, default) or `fp8` |
 | `GRAPHS` | `1` (default): prefill CUDA graphs and the two-part prefill overlap, requires the optional patch. `0`: eager prefill. |
 | `SPEC` | `1`: DSpark speculative decoding |
+| `SPEC_K` | DSpark drafts verified per step, 1–7, default 3 |
 | `IMAGES` | images per prompt, default 4; `0` for text only |
 | `PROFILE` | `fast` (default): 4k prefill chunks, 1,000,000-token context. `context`: 2k chunks, 1,048,576 tokens. |
 | `MAXLEN` | context window; lower it to fit the KV capacity of the chosen configuration |

@@ -508,7 +508,7 @@ index 000000000..cc28c3e48
 +def inkling2_state_copy_funcs():
 +    return MambaStateCopyFuncCalculator.short_conv_state_copy_func()
 diff --git a/vllm/models/inkling2/dspark.py b/vllm/models/inkling2/dspark.py
-index ddf170bb3..265f1ba47 100644
+index ddf170bb3..5badb8127 100644
 --- a/vllm/models/inkling2/dspark.py
 +++ b/vllm/models/inkling2/dspark.py
 @@ -53,6 +53,76 @@ from .ops.linear import linear
@@ -623,7 +623,22 @@ index ddf170bb3..265f1ba47 100644
                  self.head_dim, dim=-1
              )
              num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
-@@ -496,9 +574,11 @@ class Inkling2DSparkModel(nn.Module):
+@@ -464,10 +542,11 @@ class Inkling2DSparkModel(nn.Module):
+         config = vllm_config.speculative_config.draft_model_config.hf_config
+         assert isinstance(config, Inkling2DSparkConfig)
+         num_spec = vllm_config.speculative_config.num_speculative_tokens
+-        if num_spec != config.draft_block_size - 1:
++        if not 1 <= num_spec <= config.draft_block_size - 1:
+             raise ValueError(
+-                "Inkling2 DSpark requires num_speculative_tokens = "
+-                f"{config.draft_block_size - 1} (the checkpoint's block size - 1)"
++                "Inkling2 DSpark supports 1 to "
++                f"{config.draft_block_size - 1} speculative tokens (the "
++                "checkpoint's block size - 1); the draft always fills its block"
+             )
+         if vllm_config.model_config.max_model_len > config.max_position_embeddings:
+             raise ValueError(
+@@ -496,9 +575,11 @@ class Inkling2DSparkModel(nn.Module):
          self.vocab_offset = get_tensor_model_parallel_rank() * num_cols
          self.valid_vocab = min(num_cols, self.config.vocab_size - self.vocab_offset)
          assert self.valid_vocab > 0
@@ -638,7 +653,7 @@ index ddf170bb3..265f1ba47 100644
          self.model.fuse_alpha.copy_(
              torch.softmax(self.model.fuse_weight.float(), dim=-1)
          )
-@@ -560,6 +640,12 @@ class Inkling2DSparkModel(nn.Module):
+@@ -560,6 +641,12 @@ class Inkling2DSparkModel(nn.Module):
          self, base_logits: torch.Tensor, bias: torch.Tensor
      ) -> torch.Tensor:
          """`markov_logits(...).argmax(-1)`, NaN as -inf."""
@@ -651,7 +666,7 @@ index ddf170bb3..265f1ba47 100644
          return dspark_argmax(
              self.argmax_workspace,
              base_logits,
-@@ -575,7 +661,11 @@ class Inkling2DSparkModel(nn.Module):
+@@ -575,7 +662,11 @@ class Inkling2DSparkModel(nn.Module):
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          params = dict(self.named_parameters())
          loaded: set[str] = set()
@@ -2136,6 +2151,23 @@ index 6beae2b0d..a8a390e96 100644
          self.hidden_states = torch.zeros(
              self.max_num_tokens,
              len(config.target_layer_ids) * config.hidden_size,
+diff --git a/vllm/models/inkling2/speculator_config.py b/vllm/models/inkling2/speculator_config.py
+index 617bc5e0f..55b2dac81 100644
+--- a/vllm/models/inkling2/speculator_config.py
++++ b/vllm/models/inkling2/speculator_config.py
+@@ -5,3 +5,12 @@ from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
+ 
+ class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
+     speculator_class = "vllm.models.inkling2.speculator.Inkling2DSparkSpeculator"
++
++    @property
++    def num_lookahead_tokens(self) -> int:
++        # The draft writes K/V for its whole block (anchor + masks), however
++        # many of its drafts are verified.
++        block = getattr(
++            self.spec_config.draft_model_config.hf_config, "draft_block_size", 0
++        )
++        return max(super().num_lookahead_tokens, block or 0)
 diff --git a/vllm/models/inkling2/tp_pad.py b/vllm/models/inkling2/tp_pad.py
 new file mode 100644
 index 000000000..fd5d21236
@@ -2286,3 +2318,39 @@ index 2098cf0a1..436ec6255 100644
          out, _ = flash_attn_varlen_func(
              q,
              k,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index c5e0b2e35..2de696cc7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -944,7 +944,11 @@ def _prepare_dflash_inputs_kernel(
+     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
+     # at offsets > 0 are sampled from, each AT its own position.
+     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
+-    is_sample = is_query & (query_off >= sample_off)
++    is_sample = (
++        is_query
++        & (query_off >= sample_off)
++        & (query_off - sample_off < num_speculative_steps)
++    )
+     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
+     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
+     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 368189737..55a1b011b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -66,6 +66,14 @@ class DSparkSpeculator(DFlashSpeculator):
+             self.num_query_per_req = self.num_speculative_steps
+         else:
+             self.num_query_per_req = 1 + self.num_speculative_steps
++            # A draft trained on a fixed block (anchor + masks) can fill its
++            # whole block while only the first num_speculative_steps drafts
++            # are sampled and verified.
++            draft_block = getattr(
++                self.draft_model_config.hf_config, "draft_block_size", None
++            )
++            if draft_block:
++                self.num_query_per_req = max(self.num_query_per_req, draft_block)
+ 
+         # DSpark consumes mean-pooled target aux hidden states at the target
+         # layers, combined to hidden_size via main_proj. Store that combined
