@@ -2,15 +2,17 @@
 # Serve Inkling-2-Small EXL3 on 3x RTX PRO 6000 (sm120) at TP3.
 # usage: MODEL=/path/to/Inkling-2-Small-EXL3-3.17bpw SRC=/path/to/src ./serve.sh
 # env:   KV_DTYPE=auto     BF16 KV cache (default) | fp8 (e4m3)
-#        GRAPHS=1          prefill CUDA graphs + two-part prefill overlap (needs the optional patch)
-#                          0: eager prefill (patches only)
+#        GRAPHS            1: prefill CUDA graphs and the two-microbatch prefill overlap (default when
+#                          optional patch 0005 is applied); 0: eager prefill (default without it)
 #        SPEC=1            DSpark speculative decoding (work in progress)
 #        SPEC_K=3          DSpark drafts verified per step with one request (1-7)
 #        SPEC_K_BATCH=2    DSpark drafts verified per request with 2+ requests
-#        IMAGES=4          max images per prompt (0: text only)
+#        IMAGES            max images per prompt (default: vLLM's 999); 0 for text only
 #        PROFILE=fast      4k prefill chunks, 1,000,000-token default context (default)
 #                context   2k prefill chunks, 1,048,576-token default context
-#        PORT (8300) UTIL (0.98) MAXSEQS (4) MAXLEN
+#        TP=3              tensor-parallel size (number of GPUs)
+#        UTIL=0.98         GPU memory fraction for vLLM; 0.98 is recommended for a 1M-token context
+#        PORT (8300) MAXSEQS (4) MAXLEN
 set -euo pipefail
 : "${MODEL:?set MODEL to the checkpoint directory}" "${SRC:?set SRC to the directory holding exllamav3 and xmoe_do}"
 
@@ -28,7 +30,11 @@ case "${PROFILE:-fast}" in
   *) echo "unknown PROFILE"; exit 1 ;;
 esac
 
-if [ "${GRAPHS:-1}" = "1" ]; then
+# Default GRAPHS from whether optional patch 0005 (the prefill overlap) is applied
+if [ -z "${GRAPHS:-}" ]; then
+  GRAPHS=$(python3 -c 'import importlib.util as u, os; s = u.find_spec("vllm"); print(int(os.path.exists(os.path.join(os.path.dirname(s.origin), "models", "inkling2", "ubatch.py"))))')
+fi
+if [ "$GRAPHS" = "1" ]; then
   export INKLING2_UBATCH_OVERLAP=1
   SIZES=$(python3 -c "print(','.join(str(s) for s in (256, 512, 1024, 2048, 4096) if s <= $BT))")
   CG=(--compilation-config "{\"prefill_cudagraph_capture_token_sizes\": [$SIZES], \"decode_cudagraph_capture_request_sizes\": [1, 2, 4]}")
@@ -47,10 +53,14 @@ if [ "${SPEC:-0}" = "1" ]; then
   SP=(--speculative-config "{\"method\": \"dspark\", \"num_speculative_tokens\": $K$SCHED}")
 fi
 
-exec vllm serve "$MODEL" --tensor-parallel-size 3 --host 0.0.0.0 --port "${PORT:-8300}" \
+# Images per prompt: vLLM's default (999) unless IMAGES is set; IMAGES=0 for text only
+MM=()
+if [ -n "${IMAGES:-}" ]; then MM=(--limit-mm-per-prompt "{\"image\": $IMAGES}"); fi
+
+exec vllm serve "$MODEL" --tensor-parallel-size "${TP:-3}" --host 0.0.0.0 --port "${PORT:-8300}" \
   --served-model-name Inkling-2-Small --max-model-len "${MAXLEN:-$DEF_LEN}" \
   --gpu-memory-utilization "${UTIL:-0.98}" --max-num-seqs "${MAXSEQS:-4}" --max-num-batched-tokens $BT \
   "${CG[@]}" "${SP[@]}" --enable-prefix-caching --mamba-cache-mode align \
   --kv-cache-dtype "${KV_DTYPE:-auto}" \
-  --limit-mm-per-prompt "{\"image\": ${IMAGES:-4}}" \
+  "${MM[@]}" \
   --reasoning-parser inkling --tool-call-parser inkling --enable-auto-tool-choice

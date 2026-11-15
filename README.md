@@ -185,7 +185,7 @@ MAX_JOBS=40 python setup.py build_ext --inplace
 
 # Decode-once prefill kernel
 mkdir -p $SRC/xmoe_do && cd $SRC/xmoe_do
-cp -r <diffbot recipe>/kernels/xmoe ./xmoe && cp <diffbot recipe>/kernels/xmoe_do/do_gemm.cu .
+cp -r <diffbot repo>/recipe/kernels/xmoe ./xmoe && cp <diffbot repo>/recipe/kernels/xmoe_do/do_gemm.cu .
 patch -p1 < do_gemm.diff                                # from the DS4.1 recipe
 patch -p1 < $REPO/patches/kernel/*.diff
 python -c 'from torch.utils.cpp_extension import load; load(name="ds41_exl3_do", sources=["do_gemm.cu"], extra_include_paths=["xmoe", "xmoe/quant"], extra_cflags=["-O3"], extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"], build_directory="build")'
@@ -203,12 +203,13 @@ MODEL=/path/to/Inkling-2-Small-EXL3-3.17bpw SRC=$SRC $REPO/scripts/serve.sh
 | Variable | Values |
 |---|---|
 | `KV_DTYPE` | `auto` (BF16, default) or `fp8` |
-| `GRAPHS` | `1` (default): prefill CUDA graphs and the two-part prefill overlap, requires the optional patch. `0`: eager prefill. |
+| `GRAPHS` | `1`: prefill CUDA graphs and the two-microbatch prefill overlap; the default when optional patch 0005 is applied. `0`: eager prefill; the default without 0005, where prefill graphs only cost KV capacity. |
 | `SPEC` | `1`: DSpark speculative decoding |
 | `SPEC_K` | DSpark drafts verified per step with one request, 1–7, default 3 |
 | `SPEC_K_BATCH` | DSpark drafts verified per request with two or more requests, default 2 |
-| `IMAGES` | images per prompt, default 4; `0` for text only |
+| `IMAGES` | maximum images per prompt; default: vLLM's limit (999). `0` for text only. |
 | `PROFILE` | `fast` (default): 4k prefill chunks, 1,000,000-token context. `context`: 2k chunks, 1,048,576 tokens. |
+| `UTIL` | GPU memory fraction for vLLM, default 0.98. 0.98 is recommended for a 1M-token context. |
 | `MAXLEN` | context window; lower it to fit the KV capacity of the chosen configuration |
 
 ## Known limitations
