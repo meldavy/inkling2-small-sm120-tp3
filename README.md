@@ -111,7 +111,7 @@ With FP8, K and V are stored as e4m3 with a scale of 1.0. Values are cast in reg
 
 ## DSpark speculative decoding (work in progress)
 
-`SPEC=1` in `serve.sh` enables the checkpoint's DSpark draft model (`mtp.safetensors`). The draft model always fills its trained 8-position block (the accepted token plus 7 masked positions); `SPEC_K` (1–7, default 3) sets how many of its drafts the main model verifies per step. Output quality matches decoding without DSpark: token log-probabilities along DSpark-decoded text agree with a plain prefill over the same tokens to within the same margin as plain decoding.
+`SPEC=1` in `serve.sh` enables the checkpoint's DSpark draft model (`mtp.safetensors`). The draft model always fills its trained 8-position block (the accepted token plus 7 masked positions); `SPEC_K` (1–7, default 3) sets how many of its drafts the main model verifies per step with one request in flight; `SPEC_K_BATCH` (default 2) applies when two or more requests share a step, since the verify cost grows with every request. Output quality matches decoding without DSpark: token log-probabilities along DSpark-decoded text agree with a plain prefill over the same tokens to within the same margin as plain decoding.
 
 **`SPEC_K=3` is the recommended starting value.** Raise it when your drafts are accepted more often (code, structured output) or when a verify step is cheap relative to a decode step on your hardware (faster GPUs, P2P interconnect), and measure with your own workload. On this system, single stream, BF16 KV, optional patches (one sweep; separate sessions vary by about ±5%):
 
@@ -130,13 +130,13 @@ All further numbers in this section use `SPEC_K=3` and the optional patches. Sin
 | 40 words starting with "st" | 159.2 tok/s | 167.4 tok/s | 2.85 / 3.04 |
 | Without DSpark | 104.8 tok/s | 105.3 tok/s | — |
 
-Concurrency: c=1 runs the four prompts one at a time. c=4 keeps four requests in flight for 90 s (each finished request is immediately replaced, prompts mixed), measured three times; ranges in parentheses.
+Concurrency: c=1 runs the four prompts one at a time (`SPEC_K=3`). c=4 (`SPEC_K_BATCH=2`) keeps four requests in flight for 90 s (each finished request is immediately replaced, prompts mixed), measured three times; ranges in parentheses.
 
 | | BF16 KV | BF16 KV + DSpark | FP8 KV | FP8 KV + DSpark |
 |---|---|---|---|---|
 | c=1, per request | 104.8 tok/s | 138.8 tok/s | 105.3 tok/s | 137.0 tok/s |
-| c=4, per request | 55.0 tok/s (54.5–55.4) | 56.0 tok/s (55.5–56.3) | 55.4 tok/s (55.2–55.5) | 55.2 tok/s (54.3–55.7) |
-| c=4, total | 213.4 tok/s (211.7–214.8) | 208.7 tok/s (206.9–210.3) | 214.6 tok/s (214.0–215.1) | 206.1 tok/s (203.6–207.9) |
+| c=4, per request | 55.0 tok/s (54.5–55.4) | 56.1 tok/s (56.0–56.3) | 55.4 tok/s (55.2–55.5) | 56.6 tok/s (56.4–56.8) |
+| c=4, total | 213.4 tok/s (211.7–214.8) | 213.7 tok/s (213.0–214.3) | 214.6 tok/s (214.0–215.1) | 214.3 tok/s (213.5–214.8) |
 
 Capacity and prefill:
 
@@ -154,7 +154,7 @@ Draft acceptance by position, over the Estonia and LAVD reasoning benchmarks (16
 Status:
 
 - A verify step checks `SPEC_K` + 1 tokens, and each token routes to 8 of 384 experts, so the expert weights a step reads grow almost linearly with `SPEC_K`. The cost of a verify step against a single-token decode step sets how many accepted tokens per step DSpark needs to be faster.
-- Under sustained 4-request load, DSpark matches decoding without it per request and delivers 2–4% less total throughput (table above): its gain is in single-stream decode.
+- Under sustained 4-request load, DSpark with `SPEC_K_BATCH=2` matches decoding without it in total throughput (table above): its gain is in single-stream decode.
 - The draft model's weights, its full-attention layer and its CUDA graphs reduce KV cache capacity.
 - The draft model's own forward pass takes 6–8 ms per step, well above what reading its weights requires.
 - vLLM's adaptive verification (`enable_adaptive_verification`) runs and produces correct output with these patches, but on this host its per-step bookkeeping costs more than it saves, so `serve.sh` leaves it off.
@@ -203,7 +203,8 @@ MODEL=/path/to/Inkling-2-Small-EXL3-3.17bpw SRC=$SRC $REPO/scripts/serve.sh
 | `KV_DTYPE` | `auto` (BF16, default) or `fp8` |
 | `GRAPHS` | `1` (default): prefill CUDA graphs and the two-part prefill overlap, requires the optional patch. `0`: eager prefill. |
 | `SPEC` | `1`: DSpark speculative decoding |
-| `SPEC_K` | DSpark drafts verified per step, 1–7, default 3 |
+| `SPEC_K` | DSpark drafts verified per step with one request, 1–7, default 3 |
+| `SPEC_K_BATCH` | DSpark drafts verified per request with two or more requests, default 2 |
 | `IMAGES` | images per prompt, default 4; `0` for text only |
 | `PROFILE` | `fast` (default): 4k prefill chunks, 1,000,000-token context. `context`: 2k chunks, 1,048,576 tokens. |
 | `MAXLEN` | context window; lower it to fit the KV capacity of the chosen configuration |
