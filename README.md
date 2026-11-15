@@ -10,9 +10,9 @@ Single stream, prefix caching on.
 
 | | BF16 KV | FP8 KV | BF16 KV + optional patches | FP8 KV + optional patches |
 |---|---|---|---|---|
-| Prefill, 8k-token prompt | 4,412 tok/s | 4,463 tok/s | 5,403 tok/s | 5,445 tok/s |
-| Prefill, 32k-token prompt | 4,400 tok/s | 4,460 tok/s | 5,365 tok/s | 5,498 tok/s |
-| Decode | 86.1 tok/s | 85.3 tok/s | 104.8 tok/s | 105.3 tok/s |
+| Prefill, 8k-token prompt | 4,412 tok/s | 4,463 tok/s | 5,418 tok/s | 5,410 tok/s |
+| Prefill, 32k-token prompt | 4,400 tok/s | 4,460 tok/s | 5,367 tok/s | 5,435 tok/s |
+| Decode | 86.1 tok/s | 85.3 tok/s | 106.3 tok/s | 106.5 tok/s |
 | KV cache capacity | 936,461 tokens | 1,885,836 tokens | 858,852 tokens | 1,729,548 tokens |
 | Context window | 850,000 tokens | 1,000,000 tokens | 850,000 tokens | 1,000,000 tokens |
 
@@ -71,9 +71,9 @@ Each patch's effect, BF16 KV cache, single stream (same method as the performanc
 
 | | 0003 | + 0004 | + 0004 + 0005 |
 |---|---|---|---|
-| Prefill, 8k-token prompt | 4,412 tok/s | 4,312 tok/s | 5,403 tok/s |
-| Prefill, 32k-token prompt | 4,400 tok/s | 4,371 tok/s | 5,365 tok/s |
-| Decode | 86.1 tok/s | 98.0 tok/s | 104.8 tok/s |
+| Prefill, 8k-token prompt | 4,412 tok/s | 4,296 tok/s | 5,418 tok/s |
+| Prefill, 32k-token prompt | 4,400 tok/s | 4,353 tok/s | 5,367 tok/s |
+| Decode | 86.1 tok/s | 98.8 tok/s | 106.3 tok/s |
 
 The "+ 0004" and "+ 0004 + 0005" columns use prefill CUDA graphs (`GRAPHS=1`).
 
@@ -82,7 +82,7 @@ The "+ 0004" and "+ 0004 + 0005" columns use prefill CUDA graphs (`GRAPHS=1`).
 | Change | Files | What it addresses |
 |---|---|---|
 | Low-M GEMV | `ops/gemv_sm12x.py`, `ops/linear.py` | The PR sends M ≤ 16 GEMMs to FlashInfer's CuTe-DSL low-M kernels, which don't run on SM120, and its cuBLAS fallback runs well below memory bandwidth. A Triton split-K GEMV handles up to 16 rows, including the router. |
-| Fused routing | `exl3_moe.py` | The PR's router (sigmoid, bias, top-8, gather, normalize) runs as separate torch ops. A single Triton kernel computes the same math for decode-size batches. |
+| Fused routing | `exl3_moe.py` | The PR's router (sigmoid, bias, top-8, gather, normalize) runs as separate torch ops. For decode-size batches a single Triton kernel computes the same math, re-zeroes the persistent split-K router-logit buffer it reads (no zero-fill kernel), and writes the experts' fp16 input (no conversion kernel). |
 | Cooperative-kernel rows | `exl3_moe.py` | `INKLING2_COOP_MAX_ROWS` (default 8) sets how many rows run on ExLlamaV3's cooperative MoE kernel. `serve.sh` sets 32 with DSpark, so verify batches of up to 4 requests stay on it. |
 
 **`0005-no-p2p-allreduce-overlap.diff`**: tensor-parallel communication for GPUs without P2P. At startup it checks CUDA peer access between the TP ranks; with peer access, both custom all-reduces stay off and all reductions use vLLM's all-reduce. `INKLING2_HOST_AR=1` and `INKLING2_DMA_AR=1` force them on, `=0` forces them off.
@@ -104,11 +104,11 @@ With FP8, K and V are stored as e4m3 with a scale of 1.0. Values are cast in reg
 | | BF16 | FP8 |
 |---|---|---|
 | KV cache capacity (optional patches) | 858,852 tokens | 1,729,548 tokens |
-| Negative log-likelihood, 8k-token real text | 1.0359 | 1.0362 |
-| Top-1 token agreement with BF16 | — | 98.0% |
-| Decode | 104.8 tok/s | 105.3 tok/s |
-| Prefill, 32k-token prompt | 5,365 tok/s | 5,498 tok/s |
-
+| Negative log-likelihood, 8k-token real text | 1.0351 / 1.0353 (two runs) | 1.0363 / 1.0366 (two runs) |
+| Mean \|Δ log p\| against a BF16 reference run | 0.030 (BF16 run-to-run) | 0.040 |
+| Top-1 token agreement with a BF16 reference run | 98.6% (BF16 run-to-run) | 98.0–98.1% |
+| Decode | 106.3 tok/s | 106.5 tok/s |
+| Prefill, 32k-token prompt | 5,367 tok/s | 5,435 tok/s |
 ## DSpark speculative decoding (work in progress)
 
 `SPEC=1` in `serve.sh` enables the checkpoint's DSpark draft model (`mtp.safetensors`). The draft model always fills its trained 8-position block (the accepted token plus 7 masked positions); `SPEC_K` (1–7, default 3) sets how many of its drafts the main model verifies per step with one request in flight; `SPEC_K_BATCH` (default 2) applies when two or more requests share a step, since the verify cost grows with every request. Output quality matches decoding without DSpark: token log-probabilities along DSpark-decoded text agree with a plain prefill over the same tokens to within the same margin as plain decoding.
@@ -124,26 +124,28 @@ All further numbers in this section use `SPEC_K=3` and the optional patches. Sin
 
 | Prompt | Decode, BF16 KV | Decode, FP8 KV | Accepted tokens per step (BF16 / FP8) |
 |---|---|---|---|
-| Python LRU cache | 132.5 tok/s | 130.4 tok/s | 2.32 / 2.34 |
-| History of Tallinn | 98.5 tok/s | 95.5 tok/s | 1.72 / 1.70 |
-| Train word problem | 165.1 tok/s | 154.5 tok/s | 2.91 / 2.78 |
-| 40 words starting with "st" | 159.2 tok/s | 167.4 tok/s | 2.85 / 3.04 |
-| Without DSpark | 104.8 tok/s | 105.3 tok/s | — |
+| Python LRU cache | 130.1 tok/s | 126.3 tok/s | 2.32 / 2.25 |
+| History of Tallinn | 90.9 tok/s | 92.6 tok/s | 1.62 / 1.64 |
+| Train word problem | 153.4 tok/s | 146.9 tok/s | 2.75 / 2.63 |
+| 40 words starting with "st" | 124.9 tok/s | 147.6 tok/s | 2.30 / 2.65 |
+| Without DSpark | 106.3 tok/s | 106.5 tok/s | — |
+
+Single-stream DSpark speed follows acceptance, which depends on the exact generated text; that text varies slightly between server sessions (prefill reductions are not bit-deterministic), so the per-prompt numbers above vary by about ±5% between sessions. The steady-state c=4 numbers below do not.
 
 Concurrency: c=1 runs the four prompts one at a time (`SPEC_K=3`). c=4 (`SPEC_K_BATCH=2`) keeps four requests in flight for 90 s (each finished request is immediately replaced, prompts mixed), measured three times; ranges in parentheses.
 
 | | BF16 KV | BF16 KV + DSpark | FP8 KV | FP8 KV + DSpark |
 |---|---|---|---|---|
-| c=1, per request | 104.8 tok/s | 138.8 tok/s | 105.3 tok/s | 137.0 tok/s |
-| c=4, per request | 55.0 tok/s (54.5–55.4) | 56.1 tok/s (56.0–56.3) | 55.4 tok/s (55.2–55.5) | 56.6 tok/s (56.4–56.8) |
-| c=4, total | 213.4 tok/s (211.7–214.8) | 213.7 tok/s (213.0–214.3) | 214.6 tok/s (214.0–215.1) | 214.3 tok/s (213.5–214.8) |
+| c=1, per request | 106.3 tok/s | 124.8 tok/s | 106.5 tok/s | 128.4 tok/s |
+| c=4, per request | 55.5 tok/s (55.4–55.6) | 56.4 tok/s (56.1–56.9) | 55.5 tok/s (55.3–55.6) | 56.4 tok/s (56.0–56.8) |
+| c=4, total | 214.7 tok/s (214.4–214.9) | 213.7 tok/s (213.1–214.1) | 214.8 tok/s (214.6–215.1) | 214.6 tok/s (213.7–215.7) |
 
 Capacity and prefill:
 
 | | BF16 KV | BF16 KV + DSpark | FP8 KV | FP8 KV + DSpark |
 |---|---|---|---|---|
-| KV cache capacity | 858,852 tokens | 512,599 tokens | 1,729,548 tokens | 1,051,158 tokens |
-| Prefill, 32k-token prompt | 5,365 tok/s | 5,540 tok/s | 5,498 tok/s | 5,235 tok/s |
+| KV cache capacity | 858,852 tokens | 519,922 tokens | 1,729,548 tokens | 1,038,326 tokens |
+| Prefill, 32k-token prompt | 5,367 tok/s | 5,306 tok/s | 5,435 tok/s | 5,164 tok/s |
 
 Draft acceptance by position, over the Estonia and LAVD reasoning benchmarks (161k verify steps):
 
@@ -216,4 +218,13 @@ MODEL=/path/to/Inkling-2-Small-EXL3-3.17bpw SRC=$SRC $REPO/scripts/serve.sh
 
 ## Credits
 
-[Thinking Machines](https://huggingface.co/thinkingmachines) (Inkling 2 Small); vLLM authors of [#67325](https://github.com/vllm-project/vllm/pull/67325) (WoosukKwon), [#51560](https://github.com/vllm-project/vllm/pull/51560) (m4xkushnir) and [#55078](https://github.com/vllm-project/vllm/pull/55078) (TheVerdman); turboderp (ExLlamaV3); diffbot (decode-once kernel); local-inference-lab (KK vLLM fork, TP3 head padding). Work is tracked in the Local Inference Lab Discord.
+- [Thinking Machines](https://huggingface.co/thinkingmachines): Inkling 2 Small.
+- [vLLM](https://github.com/vllm-project/vllm): the serving engine, including its DSpark speculator, per-batch-size draft schedule, speculative short-conv metadata, breakable CUDA graphs and multimodal encoder attention. Inkling 2 support by WoosukKwon ([#67325](https://github.com/vllm-project/vllm/pull/67325)); Triton attention fallbacks for Inkling by m4xkushnir ([#51560](https://github.com/vllm-project/vllm/pull/51560)) and TheVerdman ([#55078](https://github.com/vllm-project/vllm/pull/55078)).
+- turboderp: [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and its EXL3 cooperative MoE kernel.
+- diffbot: the decode-once EXL3 MoE kernel ([DeepSeek-V4.1-Flash recipe](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000)).
+- [Local Inference Lab](https://github.com/local-inference-lab): the KK vLLM fork's TP3 head padding and [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (Estonia, LAVD and hotel-lights benchmarks). JCartu and TheRez for the DSpark draft-count findings on RTX PRO 6000 that `SPEC_K=3` follows.
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer): kernels and NVLink all-reduce paths used by the vLLM PR.
+- NVIDIA [NCCL](https://github.com/NVIDIA/nccl): the LL protocol the host-mapped all-reduce follows.
+- DeepSeek's two-batch overlap and vLLM's dual-batch overlap: the idea behind the two-microbatch prefill overlap.
+
+Work is tracked in the Local Inference Lab Discord.

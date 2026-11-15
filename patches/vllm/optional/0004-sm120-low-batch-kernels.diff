@@ -1,8 +1,8 @@
 diff --git a/vllm/models/inkling2/exl3_moe.py b/vllm/models/inkling2/exl3_moe.py
-index 9efa3dedc..73479600a 100644
+index 9efa3dedc..61a29f30c 100644
 --- a/vllm/models/inkling2/exl3_moe.py
 +++ b/vllm/models/inkling2/exl3_moe.py
-@@ -40,9 +40,48 @@ EXPERT_NAME = re.compile(
+@@ -40,9 +40,77 @@ EXPERT_NAME = re.compile(
      r"^model\.llm\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(w[123])\.(trellis|suh|svh|mul1|mcg)$"
  )
  _ACT_INKLING2 = 5
@@ -18,14 +18,25 @@ index 9efa3dedc..73479600a 100644
 +
 +
 +@triton.jit
-+def _route_topk_kernel(Logits, Bias, Wout, Ids, E, scale,
-+                       TOPK: tl.constexpr, BLOCK_E: tl.constexpr):
++def _route_topk_kernel(Logits, Bias, Wout, Ids, E, scale, X, XH, H,
++                       TOPK: tl.constexpr, BLOCK_E: tl.constexpr, ZERO: tl.constexpr,
++                       CONVERT: tl.constexpr, BLOCK_H: tl.constexpr):
 +    """One row: sigmoid scores, top-k of (score + bias), weights = normalized
-+    scores of the chosen experts * scale (fp16), ids (int64)."""
++    scores of the chosen experts * scale (fp16), ids (int64). ZERO: clear the
++    logits row after reading it (persistent split-K buffer). CONVERT: also
++    write the fp16 copy of the row of X the experts read."""
 +    row = tl.program_id(0)
 +    e = tl.arange(0, BLOCK_E)
 +    em = e < E
 +    logit = tl.load(Logits + row * E + e, mask=em, other=0.0)
++    if ZERO:
++        tl.store(Logits + row * E + e, tl.zeros((BLOCK_E,), tl.float32), mask=em)
++    if CONVERT:
++        for h0 in range(0, H, BLOCK_H):
++            h = h0 + tl.arange(0, BLOCK_H)
++            hm = h < H
++            xv = tl.load(X + row.to(tl.int64) * H + h, mask=hm, other=0.0)
++            tl.store(XH + row.to(tl.int64) * H + h, xv.to(tl.float16), mask=hm)
 +    score = tl.sigmoid(logit)
 +    key = tl.where(em, score + tl.load(Bias + e, mask=em, other=0.0).to(tl.float32), float("-inf"))
 +    k = tl.arange(0, TOPK)
@@ -42,19 +53,53 @@ index 9efa3dedc..73479600a 100644
 +    tl.store(Ids + row * TOPK + k, ids.to(tl.int64))
 +
 +
-+def fused_route(logits: torch.Tensor, bias: torch.Tensor, topk: int, scale: float):
++def fused_route(logits: torch.Tensor, bias: torch.Tensor, topk: int, scale: float,
++                x: torch.Tensor | None = None, xh: torch.Tensor | None = None, zero: bool = False):
 +    T, E = logits.shape
 +    w = torch.empty((T, topk), dtype=torch.float16, device=logits.device)
 +    ids = torch.empty((T, topk), dtype=torch.int64, device=logits.device)
-+    _route_topk_kernel[(T,)](logits, bias, w, ids, E, float(scale), topk,
-+                             triton.next_power_of_2(E), num_warps=4)
++    convert = x is not None
++    H = x.shape[1] if convert else 0
++    _route_topk_kernel[(T,)](logits, bias, w, ids, E, float(scale),
++                             x if convert else logits, xh if convert else logits, H, topk,
++                             triton.next_power_of_2(E), zero, convert, 1024, num_warps=4)
 +    return w, ids
++
++
++_ROUTE_BUFS: dict = {}
++
++
++def _route_bufs(device, E: int, H: int):
++    """Persistent per-device buffers: zeroed fp32 router logits (re-zeroed by
++    the route kernel) and the fp16 expert input, for decode-size batches."""
++    key = (str(device), E, H)
++    b = _ROUTE_BUFS.get(key)
++    if b is None:
++        b = _ROUTE_BUFS[key] = (torch.zeros((GEMV_MAX_TOKENS, E), dtype=torch.float32, device=device),
++                                torch.empty((GEMV_MAX_TOKENS, H), dtype=torch.float16, device=device))
++    return b
 +
 +_COOP_MAX_ROWS = int(os.environ.get("INKLING2_COOP_MAX_ROWS", "8"))
  _FUSED_ROWS = int(os.environ.get("INKLING2_EXL3_FUSED_ROWS", "512"))
  _MTILE_T1, _MTILE_T2 = 16, 32
  _DO_ENABLED = os.environ.get("INKLING2_EXL3_DO", "1") == "1"
-@@ -349,8 +388,12 @@ class Inkling2Exl3MoE(nn.Module):
+@@ -212,11 +280,13 @@ class Inkling2Exl3Experts(nn.Module):
+ 
+     # ---- compute ----------------------------------------------------------------
+ 
+-    def forward(self, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
++    def forward(self, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor,
++                xh: torch.Tensor | None = None) -> torch.Tensor:
+         tokens = x.shape[0]
+         if tokens == 0:
+             return torch.zeros((0, self.hidden), dtype=torch.float32, device=x.device)
+-        xh = x.to(torch.float16)
++        if xh is None:
++            xh = x.to(torch.float16)
+         if tokens <= _COOP_MAX_ROWS:
+             return self._coop(xh, weights, ids)
+         if _DO_ENABLED and tokens >= _DO_MIN_TOKENS and (_DO_CAPTURE or not torch.cuda.is_current_stream_capturing()):
+@@ -349,8 +419,12 @@ class Inkling2Exl3MoE(nn.Module):
          self.tp_size = get_tensor_model_parallel_world_size()
  
      def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -69,12 +114,31 @@ index 9efa3dedc..73479600a 100644
          scores = logits.sigmoid()
          ids = torch.topk(scores + self.gate.bias, self.gate.topk, dim=-1, sorted=False).indices
          w = scores.gather(1, ids)
+@@ -361,6 +435,16 @@ class Inkling2Exl3MoE(nn.Module):
+         if push is not None or lora is not None or not reduce:
+             raise NotImplementedError("EXL3 experts support the plain all-reduce path only")
+         x = x.contiguous()
+-        w, ids = self.route(x)
+-        out = self.experts(x, w, ids).to(x.dtype)
++        T = x.shape[0]
++        if _SM12X_GEMV and _FUSED_ROUTE and 0 < T <= min(GEMV_MAX_TOKENS, _COOP_MAX_ROWS):
++            # One routing kernel: reads (and re-zeroes) the split-K router
++            # logits and writes the experts' fp16 input.
++            lbuf, xbuf = _route_bufs(x.device, self.gate.weight.shape[0], x.shape[1])
++            logits = gemv_lowm(x, self.gate.weight, torch.float32, out=lbuf[:T])
++            w, ids = fused_route(logits, self.gate.bias, self.gate.topk, self.gate.route_scale,
++                                 x=x, xh=xbuf[:T], zero=logits.data_ptr() == lbuf.data_ptr())
++            out = self.experts(x, w, ids, xh=xbuf[:T]).to(x.dtype)
++        else:
++            w, ids = self.route(x)
++            out = self.experts(x, w, ids).to(x.dtype)
+         return out if self.tp_size == 1 else ink_all_reduce(out)
 diff --git a/vllm/models/inkling2/ops/gemv_sm12x.py b/vllm/models/inkling2/ops/gemv_sm12x.py
 new file mode 100644
-index 000000000..99a7b2c0c
+index 000000000..4a8109054
 --- /dev/null
 +++ b/vllm/models/inkling2/ops/gemv_sm12x.py
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,45 @@
 +"""Low-M (decode) GEMV for SM12x: y[M, N] = x[M, K] @ W[N, K]^T, fp32 accumulate, M <= 16.
 +Each weight tile is read once and multiplied against all rows (zero-padded to 16) with tl.dot."""
 +import torch
@@ -104,7 +168,8 @@ index 000000000..99a7b2c0c
 +    else:
 +        tl.atomic_add(Y + rm[:, None] * stride_ym + rn[None, :], acc, mask=ymask)
 +
-+def gemv_lowm(x, w, out_dtype=None, block_n=None, block_k=None, split_k=None):
++def gemv_lowm(x, w, out_dtype=None, block_n=None, block_k=None, split_k=None, out=None):
++    """`out`: optional fp32 (M, N) buffer, all zero, used by split-K instead of a zeroed allocation."""
 +    M, K = x.shape; N = w.shape[0]
 +    assert M <= 16
 +    out_dtype = out_dtype or x.dtype
@@ -113,7 +178,7 @@ index 000000000..99a7b2c0c
 +    block_n = block_n or 16
 +    block_k = block_k or 256
 +    if split_k > 1:
-+        y = torch.zeros((M, N), dtype=torch.float32, device=x.device)
++        y = out if out is not None else torch.zeros((M, N), dtype=torch.float32, device=x.device)
 +    else:
 +        y = torch.empty((M, N), dtype=out_dtype, device=x.device)
 +    _gemv_kernel[(triton.cdiv(N, block_n), split_k)](x, w, y, M, N, K, x.stride(0), y.stride(0),

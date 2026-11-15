@@ -76,10 +76,10 @@ index cc28c3e48..422296736 100644
          if b is None:
              t, r = self._max_tokens, self._max_reqs
 diff --git a/vllm/models/inkling2/exl3_moe.py b/vllm/models/inkling2/exl3_moe.py
-index 73479600a..de620a030 100644
+index 61a29f30c..fdfccf6ef 100644
 --- a/vllm/models/inkling2/exl3_moe.py
 +++ b/vllm/models/inkling2/exl3_moe.py
-@@ -121,11 +121,88 @@ def _do_ext():
+@@ -150,11 +150,88 @@ def _do_ext():
      return _do
  
  
