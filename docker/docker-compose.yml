@@ -1,0 +1,30 @@
+# Inkling-2-Small EXL3 on 3x RTX PRO 6000 (TP3). Set MODEL_DIR to the downloaded checkpoint.
+#   MODEL_DIR=/path/to/Inkling-2-Small-EXL3-3.17bpw docker compose up -d
+services:
+  inkling2:
+    image: ghcr.io/meldavy/inkling2-small-sm120-tp3:latest
+    ipc: host
+    shm_size: 32g
+    ulimits:
+      memlock: -1
+    ports:
+      - "8300:8300"
+    volumes:
+      - ${MODEL_DIR:?set MODEL_DIR}:/model:ro
+      - ./cache:/root/.cache          # Triton / torch extension caches, kept across restarts
+    environment:
+      KV_DTYPE: fp8        # fp8 | auto (BF16)
+      SPEC: "1"            # DSpark speculative decoding; 0 to disable
+      SPEC_K: "3"          # drafts verified per step with one request
+      SPEC_K_BATCH: "2"    # drafts per request with two or more requests
+      MAXLEN: "1000000"    # context window
+      UTIL: "0.98"         # GPU memory fraction; 0.98 recommended for a 1M-token context
+      # IMAGES: "0"        # set to cap images per prompt; 0 for text only
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 3
+              capabilities: [gpu]
+    restart: unless-stopped

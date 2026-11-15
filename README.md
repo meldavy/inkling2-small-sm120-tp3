@@ -158,8 +158,54 @@ Status:
 - A verify step checks `SPEC_K` + 1 tokens, and each token routes to 8 of 384 experts, so the expert weights a step reads grow almost linearly with `SPEC_K`. The cost of a verify step against a single-token decode step sets how many accepted tokens per step DSpark needs to be faster.
 - Under sustained 4-request load, DSpark with `SPEC_K_BATCH=2` matches decoding without it in total throughput (table above): its gain is in single-stream decode.
 - The draft model's weights, its full-attention layer and its CUDA graphs reduce KV cache capacity.
-- The draft model's own forward pass takes 6–8 ms per step, well above what reading its weights requires.
+- At `SPEC_K=3`, a full step takes 17.2 ms, of which the draft model takes 1.8 ms (CUDA-event timing of graph replays); the rest is the target model's verify pass, dominated by its MoE layers.
 - vLLM's adaptive verification (`enable_adaptive_verification`) runs and produces correct output with these patches, but on this host its per-step bookkeeping costs more than it saves, so `serve.sh` leaves it off.
+
+## Docker
+
+Prebuilt images contain vLLM with all patches in this repo (including the optional ones), ExLlamaV3 and the decode-once prefill kernel, built from [`docker/Dockerfile`](docker/Dockerfile):
+
+| Image | Platforms |
+|---|---|
+| [`ghcr.io/meldavy/inkling2-small-sm120-tp3:latest`](https://github.com/meldavy/inkling2-small-sm120-tp3/pkgs/container/inkling2-small-sm120-tp3) | `linux/amd64`, `linux/arm64` |
+
+The host needs an NVIDIA driver with CUDA 13.0 support (580 or newer) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+
+1. Download the model:
+
+   ```bash
+   hf download mel-bw/Inkling-2-Small-EXL3-3.17bpw --local-dir /path/to/Inkling-2-Small-EXL3-3.17bpw
+   ```
+
+2. Save [`docker/docker-compose.yml`](docker/docker-compose.yml) and start the server:
+
+   ```bash
+   curl -fsSLO https://raw.githubusercontent.com/meldavy/inkling2-small-sm120-tp3/main/docker/docker-compose.yml
+   MODEL_DIR=/path/to/Inkling-2-Small-EXL3-3.17bpw docker compose up -d
+   docker compose logs -f        # ready when "Application startup complete" appears, about 5 minutes
+   ```
+
+3. Send a request:
+
+   ```bash
+   curl http://localhost:8300/v1/chat/completions -H 'Content-Type: application/json' \
+     -d '{"model": "Inkling-2-Small", "messages": [{"role": "user", "content": "Hello"}]}'
+   ```
+
+The compose file runs FP8 KV, DSpark at `SPEC_K=3`/`SPEC_K_BATCH=2` and a 1,000,000-token context on 3 GPUs. Every variable in [Launch](#launch) is set through `environment:`; `TP` sets the number of GPUs (and the compose `count`). The same container without compose:
+
+```bash
+docker run -d --gpus all --ipc host --shm-size 32g -p 8300:8300 \
+  -v /path/to/Inkling-2-Small-EXL3-3.17bpw:/model:ro \
+  -e KV_DTYPE=fp8 -e SPEC=1 ghcr.io/meldavy/inkling2-small-sm120-tp3:latest
+```
+
+To build the image yourself (about an hour, mostly vLLM), from the repo root:
+
+```bash
+docker build -f docker/Dockerfile -t inkling2-small-sm120 .                                    # all patches
+docker build -f docker/Dockerfile --build-arg OPTIONAL_PATCHES=0 -t inkling2-small-sm120:base .  # patches 0001-0003 only
+```
 
 ## Build
 
@@ -198,7 +244,7 @@ hf download mel-bw/Inkling-2-Small-EXL3-3.17bpw --local-dir /path/to/Inkling-2-S
 MODEL=/path/to/Inkling-2-Small-EXL3-3.17bpw SRC=$SRC $REPO/scripts/serve.sh
 ```
 
-[`scripts/serve.sh`](scripts/serve.sh) serves an OpenAI-compatible API on port 8300 as `Inkling-2-Small`, with reasoning and tool-call parsing and up to 4 images per prompt. Startup takes about 5 minutes.
+[`scripts/serve.sh`](scripts/serve.sh) serves an OpenAI-compatible API on port 8300 as `Inkling-2-Small`, with reasoning and tool-call parsing. Startup takes about 5 minutes.
 
 | Variable | Values |
 |---|---|
